@@ -86,6 +86,10 @@ Check available models with `ollama list`.
 4. **State the done condition.** End every prompt with what success looks like.
 5. **Limit scope to one file when possible.** Multi-file edits cause confusion.
 6. **For test runs:** just ask for the command output — don't ask it to fix failures too.
+7. **Parallelise read-only work.** Issue independent exploration, review, and run-and-report
+   tasks as parallel `run_local_agent` calls — each goes to its own worker, extras queue.
+8. **Never run two file-modifying tasks in parallel.** Workers share one checkout.
+9. **On "no healthy worker":** call `local_worker_status` before retrying.
 
 ---
 

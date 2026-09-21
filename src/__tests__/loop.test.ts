@@ -196,6 +196,14 @@ describe("formatAgentResult", () => {
     expect(text).toContain("Summary.");
   });
 
+  it("prepends a run header only when run info is given", () => {
+    const run = { workerId: "gpu0", model: "m", jobId: "3f2a1c9e", elapsedMs: 17_840 };
+    expect(formatAgentResult({ ...base, iterationCount: 3 }, 20, run)).toBe(
+      "[worker gpu0 | m | job 3f2a1c9e | 17.8s | 3 iterations]\nSummary.",
+    );
+    expect(formatAgentResult(base, 20)).toBe("Summary.");
+  });
+
   it("reports the iteration limit", () => {
     const text = formatAgentResult({ ...base, finalMessage: "", stoppedByLimit: true }, 20);
     expect(text).toContain("max iterations reached (20)");

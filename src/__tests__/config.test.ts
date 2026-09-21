@@ -15,6 +15,7 @@ const ENV_KEYS = [
   "AGENT_SHELL_MODE",
   "AGENT_ALLOWED_COMMANDS",
   "AGENT_NUM_CTX",
+  "AGENT_WORKERS",
 ] as const;
 
 function snapshotEnv(): Record<string, string | undefined> {
@@ -60,7 +61,9 @@ describe("loadConfig", () => {
   it("returns defaults when no env vars set", () => {
     setup();
     const config = loadConfig();
-    expect(config.ollamaHost).toBe("http://localhost:11434");
+    expect(config.workers).toEqual([
+      { id: "default", host: "http://localhost:11434", model: "qwen2.5-coder:7b" },
+    ]);
     expect(config.model).toBe("qwen2.5-coder:7b");
     expect(config.workingDir).toBe(process.cwd());
     expect(config.maxIterations).toBe(20);
@@ -91,10 +94,41 @@ describe("loadConfig", () => {
   // CONF-01: OLLAMA_HOST
   // -------------------------------------------------------------------
 
-  it("OLLAMA_HOST overrides ollamaHost", () => {
+  it("OLLAMA_HOST sets the host of the single default worker", () => {
     setup({ OLLAMA_HOST: "http://custom:1234" });
     const config = loadConfig();
-    expect(config.ollamaHost).toBe("http://custom:1234");
+    expect(config.workers).toHaveLength(1);
+    expect(config.workers[0]!.host).toBe("http://custom:1234");
+  });
+
+  // -------------------------------------------------------------------
+  // CONF-09: AGENT_WORKERS
+  // -------------------------------------------------------------------
+
+  it("AGENT_WORKERS defines several workers, trimmed, sharing AGENT_MODEL", () => {
+    setup({ AGENT_WORKERS: "gpu0=http://a:11434, gpu1=http://a:11435/", AGENT_MODEL: "m" });
+    expect(loadConfig().workers).toEqual([
+      { id: "gpu0", host: "http://a:11434", model: "m" },
+      { id: "gpu1", host: "http://a:11435", model: "m" },
+    ]);
+  });
+
+  it("AGENT_WORKERS wins over OLLAMA_HOST", () => {
+    setup({ AGENT_WORKERS: "gpu0=http://a:11434", OLLAMA_HOST: "http://ignored:1" });
+    expect(loadConfig().workers.map((w) => w.host)).toEqual(["http://a:11434"]);
+  });
+
+  it.each([
+    ["no equals sign", "gpu0"],
+    ["empty id", "=http://a:1"],
+    ["id with a space", "gpu 0=http://a:1"],
+    ["not a URL", "gpu0=notaurl"],
+    ["non-http scheme", "gpu0=ftp://a:1"],
+    ["duplicate id", "gpu0=http://a:1,gpu0=http://b:1"],
+    ["empty value", ""],
+  ])("AGENT_WORKERS with %s throws ConfigError", (_name, value) => {
+    setup({ AGENT_WORKERS: value });
+    expect(() => loadConfig()).toThrow(ConfigError);
   });
 
   // -------------------------------------------------------------------

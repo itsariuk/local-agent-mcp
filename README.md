@@ -75,7 +75,8 @@ All settings are controlled via environment variables. Set them in your MCP conf
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint. Defines a single worker named `default` |
+| `AGENT_WORKERS` | *(unset)* | Several Ollama endpoints as `id=url,id=url` (e.g., `gpu0=http://host:11434,gpu1=http://host:11435`). Overrides `OLLAMA_HOST`. See [Multiple workers](#multiple-workers) |
 | `AGENT_MODEL` | `qwen2.5-coder:7b` | Model to use for agent tasks |
 | `AGENT_WORKING_DIR` | Current directory | Root directory for file operations |
 | `AGENT_MAX_ITERATIONS` | `20` | Maximum tool-call rounds before stopping |
@@ -126,6 +127,42 @@ Use `AGENT_ALLOWED_COMMANDS` to add commands to this list. For example, `AGENT_A
 Check the tag with `ollama list`. Lower `AGENT_NUM_CTX` if the model plus context does not fit in VRAM.
 
 Invalid values cause the server to exit immediately with a clear error message — no silent defaults.
+
+## Multiple workers
+
+Set `AGENT_WORKERS` to run jobs on more than one Ollama endpoint — typically one Ollama instance per GPU:
+
+```json
+"env": {
+  "AGENT_WORKERS": "gpu0=http://<gpu-host>:11434,gpu1=http://<gpu-host>:11435",
+  "AGENT_MODEL": "qwen3.8:27b",
+  "AGENT_NUM_CTX": "32768"
+}
+```
+
+- Each worker runs **one job at a time**. Parallel `run_local_agent` calls go to different workers; extra calls wait in a first-in, first-out queue.
+- A worker is probed (`GET /api/version`) before every job. A dead one is skipped and the job goes to the next worker. A job is never moved once it has started, because it may already have written files.
+- Every report starts with a line saying where it ran: `[worker gpu0 | qwen3.8:27b | job 3f2a1c9e | 17.8s | 3 iterations]`. The time includes any wait in the queue.
+- Pass `worker: "gpu1"` to `run_local_agent` to target one worker, for diagnostics.
+- All workers use `AGENT_MODEL`.
+
+With a single endpoint (just `OLLAMA_HOST`, or one entry in `AGENT_WORKERS`) you still get the queue and the health check: parallel calls line up instead of competing for the same GPU.
+
+**Parallel jobs share one working directory.** Run read-only tasks (exploration, review, running tests) in parallel freely; do not run two file-modifying tasks at the same time.
+
+The `local_worker_status` tool shows the pool:
+
+```json
+{
+  "workers": [
+    { "id": "gpu0", "status": "busy", "model": "qwen3.8:27b", "job_id": "3f2a1c9e", "busy_seconds": 12 },
+    { "id": "gpu1", "status": "idle", "model": "qwen3.8:27b" }
+  ],
+  "queued": 0
+}
+```
+
+`status` is `idle`, `busy`, `probing` (claimed for a job, health check still running), or `unhealthy` (the endpoint did not answer its last probe).
 
 ## Supported Models
 
@@ -179,6 +216,10 @@ The agent tried to access a file outside its working directory. Set `AGENT_WORKI
 **Bash commands fail on Windows**
 
 Bash execution uses Unix process groups (`kill(-pid)`) which are not available on Windows. File tools (`read_file`, `write_file`, `replace_text`, `list_dir`) work on all platforms. Set `AGENT_SHELL_MODE=none` to disable bash entirely.
+
+### "no healthy worker available"
+
+No configured endpoint answered its health probe. Call `local_worker_status` to see which workers are `unhealthy`, then check that Ollama is running on those hosts and listening on a reachable address (`OLLAMA_HOST=0.0.0.0:11434` on the Ollama side if it is on another machine).
 
 ## License
 

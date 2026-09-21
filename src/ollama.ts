@@ -74,3 +74,15 @@ export async function chatWithOllama(
 
   return (await resp.json()) as OllamaChatResponse;
 }
+
+const HEALTH_TIMEOUT_MS = 3000;
+
+/** Liveness probe. Never throws; does not load a model. */
+export async function checkHealth(host: string, timeoutMs = HEALTH_TIMEOUT_MS): Promise<boolean> {
+  try {
+    const resp = await fetch(`${host}/api/version`, { signal: AbortSignal.timeout(timeoutMs) });
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}

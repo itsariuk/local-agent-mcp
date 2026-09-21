@@ -2,7 +2,7 @@
  * Configuration module — reads environment variables at startup with
  * documented defaults and fail-fast validation.
  *
- * Covers CONF-01 through CONF-08.
+ * Covers CONF-01 through CONF-09.
  */
 
 import { DEFAULT_ALLOWED_COMMANDS } from "./security.js";
@@ -23,8 +23,14 @@ export class ConfigError extends Error {
 // AppConfig
 // ---------------------------------------------------------------------------
 
+export interface WorkerConfig {
+  id: string;
+  host: string;
+  model: string;
+}
+
 export interface AppConfig {
-  ollamaHost: string;
+  workers: readonly WorkerConfig[];
   model: string;
   workingDir: string;
   maxIterations: number;
@@ -52,16 +58,44 @@ function parsePositiveInt(envKey: string, defaultValue: number): number {
   return parsed;
 }
 
+const WORKER_ID = /^[\w-]+$/;
+
+function parseWorkers(raw: string, model: string): WorkerConfig[] {
+  const expected = "id=http://host:port[,id=http://host:port...]";
+  const workers: WorkerConfig[] = [];
+  for (const entry of raw.split(",").map((s) => s.trim())) {
+    // First "=" only: the URL itself may contain one
+    const eq = entry.indexOf("=");
+    const id = entry.slice(0, eq).trim();
+    const url = entry.slice(eq + 1).trim();
+    if (
+      eq < 1 ||
+      !WORKER_ID.test(id) ||
+      !/^https?:\/\//.test(url) ||
+      !URL.canParse(url) ||
+      workers.some((w) => w.id === id)
+    ) {
+      throw new ConfigError("AGENT_WORKERS", raw, expected);
+    }
+    workers.push({ id, host: url.replace(/\/+$/, ""), model });
+  }
+  return workers;
+}
+
 // ---------------------------------------------------------------------------
 // loadConfig
 // ---------------------------------------------------------------------------
 
 export function loadConfig(): AppConfig {
-  // CONF-01
-  const ollamaHost = process.env.OLLAMA_HOST ?? "http://localhost:11434";
-
   // CONF-02
   const model = process.env.AGENT_MODEL ?? "qwen2.5-coder:7b";
+
+  // CONF-01 / CONF-09: AGENT_WORKERS wins; OLLAMA_HOST alone means one worker
+  const rawWorkers = process.env.AGENT_WORKERS;
+  const workers =
+    rawWorkers !== undefined
+      ? parseWorkers(rawWorkers, model)
+      : [{ id: "default", host: process.env.OLLAMA_HOST ?? "http://localhost:11434", model }];
 
   // CONF-03
   const workingDir = process.env.AGENT_WORKING_DIR ?? process.cwd();
@@ -95,7 +129,7 @@ export function loadConfig(): AppConfig {
     process.env.AGENT_NUM_CTX === undefined ? undefined : parsePositiveInt("AGENT_NUM_CTX", 0);
 
   return {
-    ollamaHost,
+    workers,
     model,
     workingDir,
     maxIterations,

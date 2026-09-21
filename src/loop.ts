@@ -203,7 +203,18 @@ export async function runAgentLoop(options: {
 // Supervisor-facing report
 // ---------------------------------------------------------------------------
 
-export function formatAgentResult(result: AgentResult, maxIterations: number): string {
+export interface RunInfo {
+  workerId: string;
+  model: string;
+  jobId: string;
+  elapsedMs: number; // includes time spent queued — the latency the supervisor saw
+}
+
+export function formatAgentResult(
+  result: AgentResult,
+  maxIterations: number,
+  run?: RunInfo,
+): string {
   const logLines: string[] = [];
 
   for (const step of result.steps) {
@@ -241,5 +252,8 @@ export function formatAgentResult(result: AgentResult, maxIterations: number): s
   }
 
   const executionLog = logLines.length > 0 ? logLines.join("\n") + "\n\n" : "";
-  return executionLog + result.finalMessage;
+  const header = run
+    ? `[worker ${run.workerId} | ${run.model} | job ${run.jobId} | ${(run.elapsedMs / 1000).toFixed(1)}s | ${result.iterationCount} iterations]\n`
+    : "";
+  return header + executionLog + result.finalMessage;
 }
