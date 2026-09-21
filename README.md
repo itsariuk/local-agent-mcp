@@ -85,7 +85,7 @@ All settings are controlled via environment variables. Set them in your MCP conf
 | `AGENT_ALLOWED_COMMANDS` | *(empty)* | Comma-separated commands to add to the default allow-list (e.g., `rm,curl`) |
 | `AGENT_NUM_CTX` | *(Ollama default)* | Context window, sent to Ollama as `options.num_ctx`. Set it for multi-step tasks (e.g., `32768`) — a small context silently drops earlier file reads |
 
-**Default allow-list** (when `AGENT_SHELL_MODE=restricted`): git, ls, cat, echo, grep, find, mkdir, cp, mv, touch, npm, node, python.
+**Default allow-list** (when `AGENT_SHELL_MODE=restricted`): git, ls, cat, echo, grep, head, tail, wc, find, mkdir, cp, mv, touch, npm, node, python.
 
 Use `AGENT_ALLOWED_COMMANDS` to add commands to this list. For example, `AGENT_ALLOWED_COMMANDS=rm,curl` adds `rm` and `curl` while keeping all defaults.
 
@@ -148,7 +148,7 @@ Set `AGENT_WORKERS` to run jobs on more than one Ollama endpoint — typically o
 
 With a single endpoint (just `OLLAMA_HOST`, or one entry in `AGENT_WORKERS`) you still get the queue and the health check: parallel calls line up instead of competing for the same GPU.
 
-**Parallel jobs share one working directory.** Run read-only tasks (exploration, review, running tests) in parallel freely; do not run two file-modifying tasks at the same time.
+**Parallel jobs:** `analyze` and `implement` mode jobs are always safe to run in parallel (see [Execution modes](#execution-modes)). Only `direct` mode jobs share the checkout — do not run two of those that modify files at the same time.
 
 The `local_worker_status` tool shows the pool:
 
@@ -163,6 +163,31 @@ The `local_worker_status` tool shows the pool:
 ```
 
 `status` is `idle`, `busy`, `probing` (claimed for a job, health check still running), or `unhealthy` (the endpoint did not answer its last probe).
+
+## Execution modes
+
+`run_local_agent` takes an optional `mode`:
+
+| Mode | Runs in | File tools | Shell | Returns |
+|------|---------|------------|-------|---------|
+| `analyze` | your checkout | read only (`read_file`, `list_dir`) | read-only list: `ls cat head tail wc grep rg find echo diff sort uniq`, and `git` limited to `status diff log show ls-files grep blame rev-parse describe show-ref`; no `>`/`tee`/`--output` or other write/exec flags; ignores `AGENT_SHELL_MODE=full` | findings |
+| `implement` | a throwaway git worktree | all | normal allow-list | report + changed files + unified diff; your checkout is never touched |
+| `direct` (default) | your checkout | all | normal allow-list | report; edits land in place |
+
+**How `implement` works.** The worktree is created under the OS temp dir from `HEAD` plus your uncommitted changes (tracked edits and untracked files), committed there as a base. Dependency directories (`node_modules`, `.venv`, `venv`, `vendor`) are symlinked in when they are git-ignored, so tests can run; build output directories are not linked, so a build inside the worktree stays inside it. The worker edits and runs commands inside the worktree. The result ends with:
+
+```
+--- changes (2 files) ---
+M	src/config.ts
+A	src/__tests__/new.test.ts
+
+diff --git a/src/config.ts b/src/config.ts
+...
+```
+
+The diff is relative to your current tree, so `git apply` (or `git apply --3way`) lands it. The worktree is removed on success; if the job errors it is kept and the error message says where, so you can inspect it (`git worktree remove --force <path>` when done). `implement` needs the working directory to be inside a git repository.
+
+**Chained commands.** In restricted mode every segment of `a && b`, `a | b`, `a; b`, `a & b` is checked against the allow-list, and command/process substitution (`$(...)`, backticks, `<(...)`) is rejected. A `;` or `&&` inside a quoted argument is rejected too — the worker gets a clear error and can rephrase.
 
 ## Supported Models
 
@@ -220,6 +245,10 @@ Bash execution uses Unix process groups (`kill(-pid)`) which are not available o
 ### "no healthy worker available"
 
 No configured endpoint answered its health probe. Call `local_worker_status` to see which workers are `unhealthy`, then check that Ollama is running on those hosts and listening on a reachable address (`OLLAMA_HOST=0.0.0.0:11434` on the Ollama side if it is on another machine).
+
+### "blocked: ... is not inside a git repository"
+
+`mode: "implement"` needs `AGENT_WORKING_DIR` (or the directory the server started in) to be inside a git repository, because it isolates the job in a `git worktree`. Use `direct` or `analyze` mode for non-git directories.
 
 ## License
 

@@ -8,6 +8,7 @@ import type { OllamaToolDefinition } from "./ollama.js";
 import {
   assertPathSafe,
   assertCommandAllowed,
+  assertReadOnlyShell,
   buildSafeEnv,
   truncateOutput,
   type ShellMode,
@@ -107,7 +108,7 @@ export const TOOL_DEFINITIONS: OllamaToolDefinition[] = [
     function: {
       name: "bash",
       description:
-        "Execute a shell command and return its stdout and stderr. Commands are restricted to a safe allow-list by default: git, ls, cat, echo, grep, find, mkdir, cp, mv, touch, npm, node, python. Use this to run builds, tests, git operations, and explore the filesystem. Use replace_text or write_file for edits, not shell redirection.",
+        "Execute a shell command and return its stdout and stderr. Commands are restricted to a safe allow-list by default: git, ls, cat, echo, grep, head, tail, wc, find, mkdir, cp, mv, touch, npm, node, python. Use this to run builds, tests, git operations, and explore the filesystem. Use replace_text or write_file for edits, not shell redirection. In read-only mode only inspection commands are allowed.",
       parameters: {
         type: "object",
         properties: {
@@ -125,6 +126,15 @@ export const TOOL_DEFINITIONS: OllamaToolDefinition[] = [
 // Colour codes are noise (and tokens) for the model and the supervisor.
 // Built from a char code: a literal escape in a regex trips no-control-regex.
 const ANSI_COLOR = new RegExp(String.fromCharCode(27) + "\\[[0-9;]*m", "g");
+
+const WRITE_TOOLS = new Set(["write_file", "replace_text"]);
+
+/** The tools offered to the model; read-only mode hides the write tools. */
+export function toolDefinitions(readOnly: boolean): OllamaToolDefinition[] {
+  return readOnly
+    ? TOOL_DEFINITIONS.filter((t) => !WRITE_TOOLS.has(t.function.name))
+    : TOOL_DEFINITIONS;
+}
 
 // ---------------------------------------------------------------------------
 // Tool result type
@@ -208,6 +218,7 @@ async function bashExec(
   shellMode: ShellMode,
   allowedCommands: readonly string[],
   timeoutMs: number,
+  readOnly: boolean,
 ): Promise<ToolResult> {
   if (shellMode === "none") {
     return { success: false, output: "bash is disabled (shell mode: none)" };
@@ -215,7 +226,9 @@ async function bashExec(
 
   const command = String(args.command ?? "");
 
-  if (shellMode === "restricted") {
+  if (readOnly) {
+    assertReadOnlyShell(command); // analyze mode ignores AGENT_SHELL_MODE=full on purpose
+  } else if (shellMode === "restricted") {
     assertCommandAllowed(command, allowedCommands);
   }
 
@@ -294,8 +307,12 @@ export async function executeTool(
   shellMode: ShellMode,
   allowedCommands: readonly string[],
   timeoutMs: number,
+  readOnly = false,
 ): Promise<ToolResult> {
   try {
+    if (readOnly && WRITE_TOOLS.has(name)) {
+      return { success: false, output: `${name} is not available in read-only mode` };
+    }
     switch (name) {
       case "read_file":
         return await readFile(args, workingDir);
@@ -306,7 +323,7 @@ export async function executeTool(
       case "list_dir":
         return await listDir(args, workingDir);
       case "bash":
-        return await bashExec(args, workingDir, shellMode, allowedCommands, timeoutMs);
+        return await bashExec(args, workingDir, shellMode, allowedCommands, timeoutMs, readOnly);
       default:
         return { success: false, output: `unknown tool: ${name}` };
     }

@@ -39,6 +39,7 @@ Always give the local agent a **bounded, explicit prompt**. Vague prompts cause 
 ```
 Use the run_local_agent tool with this prompt:
 
+mode: analyze | implement | direct
 "Read [exact file path(s)].
 [Single specific action — one task only].
 Do not read any other files.
@@ -86,9 +87,12 @@ Check available models with `ollama list`.
 4. **State the done condition.** End every prompt with what success looks like.
 5. **Limit scope to one file when possible.** Multi-file edits cause confusion.
 6. **For test runs:** just ask for the command output — don't ask it to fix failures too.
-7. **Parallelise read-only work.** Issue independent exploration, review, and run-and-report
-   tasks as parallel `run_local_agent` calls — each goes to its own worker, extras queue.
-8. **Never run two file-modifying tasks in parallel.** Workers share one checkout.
+7. **Pick the mode.** `mode: "analyze"` for exploration, review, and run-and-report (enforced
+   read-only). `mode: "implement"` for edits you want back as a diff, isolated from the
+   checkout. Omit (`direct`) only when the edit should land in place right away.
+8. **Parallelise freely in analyze/implement mode** — each call gets its own worker, extras
+   queue, implement jobs get their own worktree. Never run two `direct` file-modifying
+   tasks at the same time: they share the checkout.
 9. **On "no healthy worker":** call `local_worker_status` before retrying.
 
 ---
@@ -132,7 +136,8 @@ Do not attempt to fix failures."
 - `replace_text` — exact, unique-match edit of part of a file (preferred for small changes)
 - `list_dir` — list directory contents
 - `bash` — run shell commands (restricted mode by default: git, ls, cat, echo, grep,
-  find, mkdir, cp, mv, touch, npm, node, python)
+  head, tail, wc, find, mkdir, cp, mv, touch, npm, node, python; every segment of a
+  chained command is checked). In analyze mode only inspection commands are allowed.
 
 It cannot: spawn subagents, call external APIs, access GSD tools, or write to
 `.planning/` — those stay with Claude.

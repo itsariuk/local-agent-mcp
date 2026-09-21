@@ -1,7 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { runAgentLoop, formatAgentResult } from "./loop.js";
+import path from "node:path";
+import { runAgentLoop, formatAgentResult, formatDiff } from "./loop.js";
+import type { AgentResult } from "./loop.js";
+import { createWorktree, captureDiff, removeWorktree } from "./worktree.js";
 import { loadConfig, ConfigError } from "./config.js";
 import type { AppConfig } from "./config.js";
 import { WorkerPool } from "./pool.js";
@@ -37,7 +40,7 @@ server.registerTool(
   "run_local_agent",
   {
     description:
-      "Run a bounded coding task on a local model. The agent can read, edit (replace_text), and write files, list directories, and run shell commands, and returns a concise report. Calls may be issued in parallel: each runs on its own worker and extra calls queue. Do not run two file-modifying tasks in parallel on the same checkout.",
+      "Run a bounded coding task on a local model. The agent can read, edit (replace_text), and write files, list directories, and run shell commands, and returns a concise report. Calls may be issued in parallel: each runs on its own worker and extra calls queue. Parallel analyze/implement calls are safe; do not run two direct calls that modify files at the same time.",
     inputSchema: {
       prompt: z.string().describe("The task or question for the local agent"),
       model: z.string().optional().describe(`Ollama model name (default: ${config.model})`),
@@ -45,30 +48,54 @@ server.registerTool(
         .string()
         .optional()
         .describe(`Run on this worker id (${workerIds}). Omit to use the first free worker.`),
+      mode: z
+        .enum(["analyze", "implement", "direct"])
+        .optional()
+        .describe(
+          "analyze: read-only against the checkout. implement: edits in an isolated git worktree seeded with your uncommitted changes; returns a diff and never touches the checkout. direct (default): edits the checkout in place.",
+        ),
     },
   },
-  async ({ prompt, model, worker }, extra) => {
+  async ({ prompt, model, worker, mode = "direct" }, extra) => {
     try {
       const started = Date.now();
       const responseText = await pool.run(
         async (w, jobId) => {
-          const result = await runAgentLoop({
-            prompt,
-            model: model ?? w.model,
-            host: w.host,
-            workingDir: config.workingDir,
-            maxIterations: config.maxIterations,
-            shellMode: config.shellMode,
-            allowedCommands: config.allowedCommands,
-            timeoutMs: config.timeoutMs,
-            numCtx: config.numCtx,
-          });
-          return formatAgentResult(result, config.maxIterations, {
+          const wt =
+            mode === "implement" ? await createWorktree(config.workingDir, jobId) : undefined;
+          let result: AgentResult;
+          let diff: { patch: string; files: string[] } | undefined;
+          try {
+            result = await runAgentLoop({
+              prompt,
+              model: model ?? w.model,
+              host: w.host,
+              workingDir: wt ? path.join(wt.path, wt.relativeDir) : config.workingDir,
+              maxIterations: config.maxIterations,
+              shellMode: config.shellMode,
+              allowedCommands: config.allowedCommands,
+              timeoutMs: config.timeoutMs,
+              numCtx: config.numCtx,
+              readOnly: mode === "analyze",
+            });
+            if (wt) diff = await captureDiff(wt.path);
+          } catch (err) {
+            // Keep the worktree for inspection and say where it is
+            const message = err instanceof Error ? err.message : String(err);
+            throw wt ? new Error(`${message} (worktree kept at ${wt.path})`, { cause: err }) : err;
+          }
+          let text = formatAgentResult(result, config.maxIterations, {
             workerId: w.id,
             model: model ?? w.model,
             jobId,
             elapsedMs: Date.now() - started,
+            mode,
           });
+          if (wt && diff) {
+            text += formatDiff(diff.patch, diff.files);
+            await removeWorktree(wt.root, wt.path);
+          }
+          return text;
         },
         { workerId: worker, signal: extra.signal },
       );

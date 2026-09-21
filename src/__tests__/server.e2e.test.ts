@@ -1,7 +1,8 @@
 // End-to-end: the real MCP server over stdio, against mock Ollama servers.
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { spawn } from "node:child_process";
+import { spawn, execFile as execFileCb } from "node:child_process";
+import { promisify } from "node:util";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -10,6 +11,18 @@ import path from "node:path";
 import os from "node:os";
 
 const CHAT_DELAY_MS = 300;
+const execFile = promisify(execFileCb);
+const git = (cwd: string, ...args: string[]) =>
+  execFile("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd }).then(
+    (r) => r.stdout,
+  );
+
+// A prompt starting with "write:" makes the mock issue one write_file call, then finish.
+const WRITE_CALL = {
+  tool_calls: [
+    { function: { name: "write_file", arguments: { path: "worker.txt", content: "w\n" } } },
+  ],
+};
 
 // ---------------------------------------------------------------------------
 // Mock Ollama
@@ -34,12 +47,29 @@ async function startMockOllama(): Promise<MockOllama> {
     mock.chats++;
     inFlight++;
     mock.maxInFlight = Math.max(mock.maxInFlight, inFlight);
-    req.resume();
-    setTimeout(() => {
-      inFlight--;
-      res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ message: { role: "assistant", content: "done" }, done: true }));
-    }, CHAT_DELAY_MS);
+    let body = "";
+    req.on("data", (chunk: Buffer) => (body += chunk.toString()));
+    req.on("end", () => {
+      const { messages } = JSON.parse(body) as {
+        messages: Array<{ role: string; content: string }>;
+      };
+      const wantsWrite =
+        messages[1]!.content.startsWith("write:") && !messages.some((m) => m.role === "tool");
+      setTimeout(() => {
+        inFlight--;
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({
+            message: {
+              role: "assistant",
+              content: wantsWrite ? "" : "done",
+              ...(wantsWrite && WRITE_CALL),
+            },
+            done: true,
+          }),
+        );
+      }, CHAT_DELAY_MS);
+    });
   });
 
   await new Promise<void>((resolve) => mock.server.listen(0, "127.0.0.1", resolve));
@@ -85,6 +115,11 @@ let tempDir: string;
 beforeAll(async () => {
   [gpu0, gpu1] = await Promise.all([startMockOllama(), startMockOllama()]);
   tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "e2e-test-"));
+  await git(tempDir, "init", "-q");
+  await fs.writeFile(path.join(tempDir, "a.txt"), "a\n");
+  await git(tempDir, "add", "-A");
+  await git(tempDir, "commit", "-qm", "base");
+  await fs.writeFile(path.join(tempDir, "u.txt"), "uncommitted\n"); // dirty on purpose
 
   child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
     env: {
@@ -164,6 +199,32 @@ describe("MCP server with two workers", { timeout: 20_000 }, () => {
   it("honours an explicit worker id", async () => {
     const result = await callTool("run_local_agent", { prompt: "a", worker: "gpu1" });
     expect(result.content[0]!.text).toMatch(/^\[worker gpu1 /);
+  });
+
+  it("implement mode returns a diff and leaves the checkout untouched", async () => {
+    const result = await callTool("run_local_agent", { prompt: "write: x", mode: "implement" });
+    const text = result.content[0]!.text;
+
+    expect(result.isError).toBeFalsy();
+    expect(text).toMatch(/^\[worker gpu\d .*\| mode implement\]/);
+    expect(text).toContain("--- changes (1 files) ---\nA\tworker.txt");
+    expect(text).toContain("+w");
+    await expect(fs.access(path.join(tempDir, "worker.txt"))).rejects.toThrow();
+    expect(await git(tempDir, "status", "--porcelain")).toBe("?? u.txt\n");
+    expect((await git(tempDir, "worktree", "list")).trim().split("\n")).toHaveLength(1);
+  });
+
+  it("analyze mode refuses the write", async () => {
+    const result = await callTool("run_local_agent", { prompt: "write: x", mode: "analyze" });
+    expect(result.content[0]!.text).toContain("write_file is not available in read-only mode");
+    await expect(fs.access(path.join(tempDir, "worker.txt"))).rejects.toThrow();
+  });
+
+  it("direct mode (default) edits the checkout in place", async () => {
+    const result = await callTool("run_local_agent", { prompt: "write: x" });
+    expect(result.content[0]!.text).toContain("| mode direct]");
+    expect(await fs.readFile(path.join(tempDir, "worker.txt"), "utf-8")).toBe("w\n");
+    await fs.rm(path.join(tempDir, "worker.txt"));
   });
 
   it("reports a dead worker and keeps working on the live one", async () => {

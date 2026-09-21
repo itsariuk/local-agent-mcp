@@ -70,7 +70,7 @@ describe("loadConfig", () => {
     expect(config.timeoutMs).toBe(120_000);
     expect(config.numCtx).toBeUndefined();
     expect(config.shellMode).toBe("restricted");
-    // All 13 default commands present
+    // All default commands present
     for (const cmd of DEFAULT_ALLOWED_COMMANDS) {
       expect(config.allowedCommands).toContain(cmd);
     }

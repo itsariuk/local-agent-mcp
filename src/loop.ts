@@ -2,7 +2,7 @@
 
 import { chatWithOllama } from "./ollama.js";
 import type { OllamaMessage, OllamaToolCall } from "./ollama.js";
-import { executeTool, TOOL_DEFINITIONS } from "./tools.js";
+import { executeTool, toolDefinitions } from "./tools.js";
 import type { ToolResult } from "./tools.js";
 import type { ShellMode } from "./security.js";
 import { parseToolCall, classifyText } from "./parser.js";
@@ -43,6 +43,16 @@ const SYSTEM_PROMPT = [
   "When finished, reply with plain text and no tool call: what you did, files changed, commands run and their results, and anything unresolved or uncertain.",
 ].join("\n");
 
+const ANALYZE_PROMPT = [
+  "You are a read-only repository analyst completing one bounded investigation for a supervisor.",
+  "You cannot modify files; only inspection commands are available.",
+  "Rules:",
+  "- Answer only the delegated question. Do not broaden scope.",
+  "- Use tools to gather evidence. Never invent file contents or claim to have run something you did not run.",
+  "- Cite file paths and line numbers for every finding.",
+  "When finished, reply with plain text and no tool call: findings with evidence, concise conclusions, and anything uncertain.",
+].join("\n");
+
 const MAX_TOOL_OUTPUT_CHARS = 16_000;
 const MAX_REPORT_EXCERPT_CHARS = 500;
 
@@ -63,6 +73,7 @@ export async function runAgentLoop(options: {
   allowedCommands: readonly string[];
   timeoutMs: number;
   numCtx?: number;
+  readOnly?: boolean;
 }): Promise<AgentResult> {
   const {
     prompt,
@@ -74,12 +85,15 @@ export async function runAgentLoop(options: {
     allowedCommands,
     timeoutMs,
     numCtx,
+    readOnly = false,
   } = options;
+
+  const tools = toolDefinitions(readOnly);
 
   const ollamaOptions = numCtx ? { options: { num_ctx: numCtx } } : {};
 
   const messages: OllamaMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: readOnly ? ANALYZE_PROMPT : SYSTEM_PROMPT },
     { role: "user", content: prompt },
   ];
 
@@ -93,7 +107,7 @@ export async function runAgentLoop(options: {
     const response = await chatWithOllama(host, {
       model,
       messages: correctionMessages,
-      tools: TOOL_DEFINITIONS,
+      tools,
       stream: false as const,
       format: "json",
       ...ollamaOptions,
@@ -107,7 +121,7 @@ export async function runAgentLoop(options: {
     const response = await chatWithOllama(host, {
       model,
       messages,
-      tools: TOOL_DEFINITIONS,
+      tools,
       stream: false as const,
       ...ollamaOptions,
     });
@@ -173,6 +187,7 @@ export async function runAgentLoop(options: {
         shellMode,
         allowedCommands,
         timeoutMs,
+        readOnly,
       );
 
       steps.push({ toolName: name, args, result });
@@ -208,6 +223,7 @@ export interface RunInfo {
   model: string;
   jobId: string;
   elapsedMs: number; // includes time spent queued — the latency the supervisor saw
+  mode: string;
 }
 
 export function formatAgentResult(
@@ -253,7 +269,19 @@ export function formatAgentResult(
 
   const executionLog = logLines.length > 0 ? logLines.join("\n") + "\n\n" : "";
   const header = run
-    ? `[worker ${run.workerId} | ${run.model} | job ${run.jobId} | ${(run.elapsedMs / 1000).toFixed(1)}s | ${result.iterationCount} iterations]\n`
+    ? `[worker ${run.workerId} | ${run.model} | job ${run.jobId} | ${(run.elapsedMs / 1000).toFixed(1)}s | ${result.iterationCount} iterations | mode ${run.mode}]\n`
     : "";
   return header + executionLog + result.finalMessage;
+}
+
+const MAX_DIFF_CHARS = 200_000;
+
+/** Implement-mode tail: changed files and the unified diff, clipped for the supervisor. */
+export function formatDiff(patch: string, files: string[]): string {
+  if (files.length === 0) return "\n\n[no files changed]";
+  const clipped =
+    patch.length > MAX_DIFF_CHARS
+      ? `${patch.slice(0, MAX_DIFF_CHARS)}\n[diff truncated: ${patch.length - MAX_DIFF_CHARS} more chars; re-run with a narrower task]`
+      : patch;
+  return `\n\n--- changes (${files.length} files) ---\n${files.join("\n")}\n\n${clipped}`;
 }

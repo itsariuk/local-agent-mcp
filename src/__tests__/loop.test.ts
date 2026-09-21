@@ -4,7 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import { chatWithOllama } from "../ollama.js";
 import type { OllamaChatResponse, OllamaMessage } from "../ollama.js";
-import { runAgentLoop, formatAgentResult } from "../loop.js";
+import { runAgentLoop, formatAgentResult, formatDiff } from "../loop.js";
 import type { AgentResult } from "../loop.js";
 
 vi.mock("../ollama.js", () => ({ chatWithOllama: vi.fn() }));
@@ -23,7 +23,7 @@ const readCall = (file: string) =>
 
 let tempDir: string;
 
-function run(extra: { numCtx?: number } = {}) {
+function run(extra: { numCtx?: number; readOnly?: boolean } = {}) {
   return runAgentLoop({
     prompt: "do the thing",
     model: "m",
@@ -132,6 +132,25 @@ describe("runAgentLoop", () => {
     expect(result.finalMessage).toBe("Recovered.");
   });
 
+  it("in read-only mode offers no write tools, uses the analyst prompt, and refuses writes", async () => {
+    chat.mockResolvedValueOnce(
+      reply({
+        tool_calls: [
+          { function: { name: "write_file", arguments: { path: "x.txt", content: "x" } } },
+        ],
+      }),
+    );
+    chat.mockResolvedValueOnce(reply({ content: "Done." }));
+
+    const result = await run({ readOnly: true });
+
+    const request = chat.mock.calls[0]![1];
+    expect(request.tools!.map((t) => t.function.name)).toEqual(["read_file", "list_dir", "bash"]);
+    expect(request.messages[0]!.content).toContain("read-only");
+    expect(result.steps[0]!.result.output).toContain("read-only");
+    await expect(fs.access(path.join(tempDir, "x.txt"))).rejects.toThrow();
+  });
+
   it("sends no format on the main call and names the tool on results", async () => {
     chat.mockResolvedValueOnce(readCall("test.txt"));
     chat.mockResolvedValueOnce(reply({ content: "Done." }));
@@ -197,9 +216,15 @@ describe("formatAgentResult", () => {
   });
 
   it("prepends a run header only when run info is given", () => {
-    const run = { workerId: "gpu0", model: "m", jobId: "3f2a1c9e", elapsedMs: 17_840 };
+    const run = {
+      workerId: "gpu0",
+      model: "m",
+      jobId: "3f2a1c9e",
+      elapsedMs: 17_840,
+      mode: "direct",
+    };
     expect(formatAgentResult({ ...base, iterationCount: 3 }, 20, run)).toBe(
-      "[worker gpu0 | m | job 3f2a1c9e | 17.8s | 3 iterations]\nSummary.",
+      "[worker gpu0 | m | job 3f2a1c9e | 17.8s | 3 iterations | mode direct]\nSummary.",
     );
     expect(formatAgentResult(base, 20)).toBe("Summary.");
   });
@@ -230,5 +255,23 @@ describe("formatAgentResult", () => {
     );
     expect(text).toContain("parse failed after 3 attempts: bad json");
     expect(text.length).toBeLessThan(700);
+  });
+});
+
+describe("formatDiff", () => {
+  it("lists files then the patch", () => {
+    expect(formatDiff("diff --git a/x b/x\n+1\n", ["M\tx"])).toBe(
+      "\n\n--- changes (1 files) ---\nM\tx\n\ndiff --git a/x b/x\n+1\n",
+    );
+  });
+
+  it("says so when nothing changed", () => {
+    expect(formatDiff("", [])).toBe("\n\n[no files changed]");
+  });
+
+  it("clips a huge patch", () => {
+    const text = formatDiff("x".repeat(300_000), ["M\tx"]);
+    expect(text.length).toBeLessThan(201_000);
+    expect(text).toContain("[diff truncated: 100000 more chars");
   });
 });

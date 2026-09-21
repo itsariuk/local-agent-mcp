@@ -21,9 +21,7 @@ import path from "node:path";
 export function assertPathSafe(targetPath: string, root: string): string {
   const resolved = path.resolve(root, targetPath);
   if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-    throw new Error(
-      "path not allowed (use AGENT_ALLOWED_PATHS to grant access)",
-    );
+    throw new Error("path not allowed (use AGENT_ALLOWED_PATHS to grant access)");
   }
   return resolved;
 }
@@ -38,32 +36,99 @@ export const DEFAULT_ALLOWED_COMMANDS: readonly string[] = [
   "cat",
   "echo",
   "grep",
+  "head",
+  "tail",
+  "wc",
   "find",
   "mkdir",
   "cp",
   "mv",
   "touch",
   "npm",
+  "npx",
   "node",
   "python",
 ] as const;
 
+// Split on shell control operators so every command in a chain is checked.
+// A lone `&` (background) counts too, except inside `>&`/`<&` descriptor
+// redirects. Quoted operators are split as well — this errs on the side of rejecting.
+const COMMAND_SEPARATORS = /\|\|?|&&|(?<![<>])&|;|\n/;
+// `$(...)`, backticks, and process substitution `<(...)` / `>(...)`
+const COMMAND_SUBSTITUTION = /\$\(|`|[<>]\(/;
+
 /**
- * Assert that the first token of `command` is in `allowList`.
+ * Assert that the first token of every command segment is in `allowList`.
  * Extracts the first whitespace-delimited token to prevent prefix attacks
  * (e.g. "gitevil" is not "git").
  */
-export function assertCommandAllowed(
-  command: string,
-  allowList: readonly string[],
-): void {
-  const trimmed = command.trim();
-  if (trimmed.length === 0) {
-    throw new Error("command not allowed (use AGENT_ALLOWED_COMMANDS to add)");
+export function assertCommandAllowed(command: string, allowList: readonly string[]): void {
+  if (COMMAND_SUBSTITUTION.test(command)) {
+    throw new Error("command not allowed (command substitution is not permitted)");
   }
-  const firstToken = trimmed.split(/\s+/)[0]!;
-  if (!allowList.includes(firstToken)) {
-    throw new Error("command not allowed (use AGENT_ALLOWED_COMMANDS to add)");
+  const segments = command.split(COMMAND_SEPARATORS).map((s) => s.trim());
+  for (const segment of segments) {
+    const firstToken = segment.split(/\s+/)[0]!;
+    if (firstToken.length === 0 || !allowList.includes(firstToken)) {
+      throw new Error("command not allowed (use AGENT_ALLOWED_COMMANDS to add)");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SAFE-08: Read-only shell profile (analyze mode)
+// ---------------------------------------------------------------------------
+
+export const READ_ONLY_COMMANDS: readonly string[] = [
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "grep",
+  "rg",
+  "find",
+  "echo",
+  "git",
+  "diff",
+  "sort",
+  "uniq",
+] as const;
+
+const READ_ONLY_GIT = new Set([
+  "status",
+  "diff",
+  "log",
+  "show",
+  "ls-files",
+  "grep",
+  "blame",
+  "rev-parse",
+  "describe",
+  "show-ref",
+]); // no `branch`/`tag`: read-only only without positional args, not worth parsing
+
+// Flags and forms through which the "read-only" commands write or execute
+const WRITE_PATTERNS: readonly RegExp[] = [
+  /(^|[^<])>(?!&[0-9]|\/dev\/null)/, // `>`/`>>` redirection; `2>&1` and `>/dev/null` are fine
+  /\btee\b/,
+  /--output\b/, // git log/diff/show, sort
+  /\bfind\b.*\s-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)\b/,
+  /\bsort\b.*\s(-o|--compress-program)\b/,
+  /\brg\b.*\s--pre\b/,
+];
+
+/** Analyze-mode shell: read-only allow-list, read-only git subcommands, no output redirection. */
+export function assertReadOnlyShell(command: string): void {
+  assertCommandAllowed(command, READ_ONLY_COMMANDS);
+  if (WRITE_PATTERNS.some((p) => p.test(command))) {
+    throw new Error("command not allowed in analyze mode (no output redirection or file writes)");
+  }
+  for (const segment of command.split(COMMAND_SEPARATORS)) {
+    const [cmd, sub] = segment.trim().split(/\s+/);
+    if (cmd === "git" && !(sub !== undefined && READ_ONLY_GIT.has(sub))) {
+      throw new Error(`command not allowed in analyze mode (git ${sub ?? ""} is not read-only)`);
+    }
   }
 }
 

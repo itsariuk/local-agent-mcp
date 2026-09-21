@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { executeTool, TOOL_DEFINITIONS } from "../tools.js";
+import { executeTool, TOOL_DEFINITIONS, toolDefinitions } from "../tools.js";
 import { DEFAULT_ALLOWED_COMMANDS } from "../security.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -29,6 +29,105 @@ describe("TOOL_DEFINITIONS", () => {
       expect(def.function.description.length).toBeGreaterThan(50);
     }
   });
+});
+
+describe("toolDefinitions", () => {
+  it("drops the write tools in read-only mode", () => {
+    expect(toolDefinitions(true).map((t) => t.function.name)).toEqual([
+      "read_file",
+      "list_dir",
+      "bash",
+    ]);
+    expect(toolDefinitions(false)).toBe(TOOL_DEFINITIONS);
+  });
+});
+
+describe("read-only mode", () => {
+  const exists = (name: string) =>
+    fs.access(path.join(tempDir, name)).then(
+      () => true,
+      () => false,
+    );
+
+  it("refuses write_file and replace_text without touching the file", async () => {
+    const write = await executeTool(
+      "write_file",
+      { path: "new.txt", content: "x" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+      true,
+    );
+    expect(write.success).toBe(false);
+    expect(write.output).toContain("read-only");
+    expect(await exists("new.txt")).toBe(false);
+
+    const replace = await executeTool(
+      "replace_text",
+      { path: "test.txt", old_text: "world", new_text: "x" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+      true,
+    );
+    expect(replace.success).toBe(false);
+    expect(await fs.readFile(path.join(tempDir, "test.txt"), "utf-8")).toBe("hello world");
+  });
+
+  it("still reads", async () => {
+    const result = await executeTool(
+      "read_file",
+      { path: "test.txt" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+      true,
+    );
+    expect(result.output).toBe("hello world");
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "limits bash to the read-only profile even in full shell mode",
+    async () => {
+      const redirect = await executeTool(
+        "bash",
+        { command: "echo hi > f" },
+        tempDir,
+        "full",
+        allowedCommands,
+        timeoutMs,
+        true,
+      );
+      expect(redirect.success).toBe(false);
+      expect(await exists("f")).toBe(false);
+
+      const npm = await executeTool(
+        "bash",
+        { command: "npm --version" },
+        tempDir,
+        "full",
+        allowedCommands,
+        timeoutMs,
+        true,
+      );
+      expect(npm.success).toBe(false);
+
+      const echo = await executeTool(
+        "bash",
+        { command: "echo hi" },
+        tempDir,
+        "full",
+        allowedCommands,
+        timeoutMs,
+        true,
+      );
+      expect(echo.success).toBe(true);
+      expect(echo.output).toContain("hi");
+    },
+  );
 });
 
 describe("read_file", () => {
