@@ -5,7 +5,7 @@ import type { OllamaMessage, OllamaToolCall } from "./ollama.js";
 import { executeTool, TOOL_DEFINITIONS } from "./tools.js";
 import type { ToolResult } from "./tools.js";
 import type { ShellMode } from "./security.js";
-import { parseToolCall } from "./parser.js";
+import { parseToolCall, classifyText } from "./parser.js";
 import type { ParseFailure } from "./parser.js";
 
 // ---------------------------------------------------------------------------
@@ -23,15 +23,35 @@ export interface AgentResult {
   finalMessage: string;
   iterationCount: number;
   stoppedByLimit: boolean;
-  parseFailure?: ParseFailure;  // per D-08
+  parseFailure?: ParseFailure; // per D-08
 }
 
 // ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT =
-  "You are a helpful coding assistant. You have access to tools for reading files, writing files, listing directories, and executing shell commands. Use these tools to complete the user's task. When you are done, respond with a final text message summarizing what you did.";
+const SYSTEM_PROMPT = [
+  "You are a coding worker completing one bounded task delegated by a supervisor.",
+  "Rules:",
+  "- Do only the delegated task. Do not broaden scope or touch unrelated files.",
+  "- Read a file before editing it. Never invent file contents.",
+  "- Prefer replace_text for edits; use write_file only for new files or full rewrites.",
+  "- Make the smallest change that works and match the existing code style.",
+  "- Run any validation command the task names. Never say a command passed unless you ran it and saw it pass.",
+  "- If the same operation fails twice, stop retrying it and report the failure.",
+  "- Do not commit, push, or access paths outside the working directory.",
+  "When finished, reply with plain text and no tool call: what you did, files changed, commands run and their results, and anything unresolved or uncertain.",
+].join("\n");
+
+const MAX_TOOL_OUTPUT_CHARS = 16_000;
+const MAX_REPORT_EXCERPT_CHARS = 500;
+
+// Keeps head and tail: errors usually sit at the end of command output.
+function clipForModel(output: string): string {
+  if (output.length <= MAX_TOOL_OUTPUT_CHARS) return output;
+  const half = MAX_TOOL_OUTPUT_CHARS / 2;
+  return `${output.slice(0, half)}\n[... clipped ${output.length - MAX_TOOL_OUTPUT_CHARS} chars ...]\n${output.slice(-half)}`;
+}
 
 export async function runAgentLoop(options: {
   prompt: string;
@@ -42,6 +62,7 @@ export async function runAgentLoop(options: {
   shellMode: ShellMode;
   allowedCommands: readonly string[];
   timeoutMs: number;
+  numCtx?: number;
 }): Promise<AgentResult> {
   const {
     prompt,
@@ -52,7 +73,10 @@ export async function runAgentLoop(options: {
     shellMode,
     allowedCommands,
     timeoutMs,
+    numCtx,
   } = options;
+
+  const ollamaOptions = numCtx ? { options: { num_ctx: numCtx } } : {};
 
   const messages: OllamaMessage[] = [
     { role: "system", content: SYSTEM_PROMPT },
@@ -71,7 +95,8 @@ export async function runAgentLoop(options: {
       messages: correctionMessages,
       tools: TOOL_DEFINITIONS,
       stream: false as const,
-      format: 'json',
+      format: "json",
+      ...ollamaOptions,
     });
     return response.message;
   };
@@ -84,7 +109,7 @@ export async function runAgentLoop(options: {
       messages,
       tools: TOOL_DEFINITIONS,
       stream: false as const,
-      format: 'json',
+      ...ollamaOptions,
     });
 
     const assistantMessage = response.message;
@@ -95,30 +120,36 @@ export async function runAgentLoop(options: {
     // Tier 1: native tool_calls (PARSE-01 fast path)
     let toolCalls: OllamaToolCall[] | null = assistantMessage.tool_calls ?? null;
 
-    // Tier 2+3: text extraction + retry (only if no native tool_calls)
+    // Tier 2: text extraction. Tier 3 (retry) only for a broken tool-call
+    // attempt — anything else without a call means the model is done.
     if (!toolCalls || toolCalls.length === 0) {
-      const parseResult = await parseToolCall(assistantMessage.content, chatFn);
+      const content = assistantMessage.content;
+      const verdict = classifyText(content);
 
-      // Check for ParseFailure (per D-07)
-      if (parseResult && 'reason' in parseResult) {
-        const failure = parseResult as ParseFailure;
+      if (Array.isArray(verdict)) {
+        toolCalls = verdict;
+      } else if (verdict === "broken") {
+        const parseResult = await parseToolCall(content, chatFn);
 
-        // Per D-07: append synthetic tool result message to history before breaking
-        messages.push({
-          role: 'tool' as const,
-          content: `[parse failed: ${failure.reason}]`,
-        });
+        // Check for ParseFailure (per D-07)
+        if ("reason" in parseResult) {
+          // Per D-07: append synthetic tool result message to history before breaking
+          messages.push({
+            role: "tool" as const,
+            content: `[parse failed: ${parseResult.reason}]`,
+          });
 
-        return {
-          steps,
-          finalMessage: "",
-          iterationCount: iteration,
-          stoppedByLimit: false,
-          parseFailure: failure,
-        };
+          return {
+            steps,
+            finalMessage: "",
+            iterationCount: iteration,
+            stoppedByLimit: false,
+            parseFailure: parseResult,
+          };
+        }
+
+        toolCalls = parseResult;
       }
-
-      toolCalls = parseResult as OllamaToolCall[] | null;
     }
 
     // If no tool calls, the model is done
@@ -128,9 +159,7 @@ export async function runAgentLoop(options: {
     }
 
     // Log iteration to stderr
-    console.error(
-      `[agent] iteration ${iteration}: ${toolCalls.length} tool call(s)`,
-    );
+    console.error(`[agent] iteration ${iteration}: ${toolCalls.length} tool call(s)`);
 
     // Process each tool call
     for (const tc of toolCalls) {
@@ -149,7 +178,11 @@ export async function runAgentLoop(options: {
       steps.push({ toolName: name, args, result });
 
       // LOOP-03: Always append tool result as role:tool, even on error
-      messages.push({ role: "tool", content: result.output });
+      messages.push({
+        role: "tool",
+        tool_name: name,
+        content: clipForModel(result.output),
+      });
     }
   }
 
@@ -164,4 +197,49 @@ export async function runAgentLoop(options: {
   }
 
   return { steps, finalMessage, iterationCount: iteration, stoppedByLimit };
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor-facing report
+// ---------------------------------------------------------------------------
+
+export function formatAgentResult(result: AgentResult, maxIterations: number): string {
+  const logLines: string[] = [];
+
+  for (const step of result.steps) {
+    const argsStr = Object.entries(step.args)
+      .map(([k, v]) => {
+        const val =
+          typeof v === "string" && v.length > 80 ? v.slice(0, 80) + "..." : JSON.stringify(v);
+        return `${k}=${val}`;
+      })
+      .join(", ");
+
+    if (step.result.success) {
+      const summary =
+        step.result.output.length > 200
+          ? `${step.result.output.split("\n").length} lines`
+          : step.result.output.trim();
+      logLines.push(`${step.toolName}(${argsStr}) → ${summary}`);
+    } else {
+      const tail = step.result.output.trim().slice(-MAX_REPORT_EXCERPT_CHARS);
+      logLines.push(`${step.toolName}(${argsStr}) → failed: ${tail}`);
+    }
+  }
+
+  if (result.stoppedByLimit) {
+    logLines.push(`[stopped: max iterations reached (${maxIterations})]`);
+  }
+
+  if (result.parseFailure) {
+    logLines.push(
+      `[parse failed after ${result.parseFailure.attemptCount} attempts: ${result.parseFailure.reason}]`,
+      result.parseFailure.rawContent.slice(0, MAX_REPORT_EXCERPT_CHARS),
+    );
+  } else if (!result.stoppedByLimit && result.finalMessage.trim() === "") {
+    logLines.push("[model returned an empty final message]");
+  }
+
+  const executionLog = logLines.length > 0 ? logLines.join("\n") + "\n\n" : "";
+  return executionLog + result.finalMessage;
 }

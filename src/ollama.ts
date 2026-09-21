@@ -4,6 +4,7 @@ export interface OllamaMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
   tool_calls?: OllamaToolCall[];
+  tool_name?: string; // role:"tool" only — which tool produced this result
 }
 
 export interface OllamaToolCall {
@@ -31,7 +32,8 @@ export interface OllamaChatRequest {
   messages: OllamaMessage[];
   tools?: OllamaToolDefinition[];
   stream: false;
-  format?: 'json';
+  format?: "json";
+  options?: { num_ctx?: number };
 }
 
 export interface OllamaChatResponse {
@@ -52,10 +54,18 @@ export async function chatWithOllama(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(request),
     });
-  } catch {
-    throw new Error(
-      `Ollama is not running at ${host} -- start it with: ollama serve`,
-    );
+  } catch (err) {
+    const code = (err as { cause?: { code?: string } }).cause?.code;
+    if (code === "UND_ERR_HEADERS_TIMEOUT") {
+      // ponytail: non-streaming request hit Node fetch's response timeout; switch to stream:true when the provider layer lands
+      throw new Error(
+        `Ollama at ${host} did not respond in time -- the generation is too long for a non-streaming request`,
+        { cause: err },
+      );
+    }
+    throw new Error(`Ollama is not running at ${host} -- start it with: ollama serve`, {
+      cause: err,
+    });
   }
 
   if (!resp.ok) {

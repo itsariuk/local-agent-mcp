@@ -1,7 +1,7 @@
 // Parser test suite — 14+ test cases covering P0-P2 failure modes from PARSING.md section 7
 
 import { describe, it, expect } from "vitest";
-import { parseToolCall } from "../parser.js";
+import { parseToolCall, classifyText } from "../parser.js";
 import type { ParseFailure, ChatFn } from "../parser.js";
 import type { OllamaMessage } from "../ollama.js";
 
@@ -39,8 +39,7 @@ describe("Tier 2: text extraction — P0 cases", () => {
   });
 
   it("strips markdown code fences (```json wrapper)", async () => {
-    const content =
-      "```json\n{\"name\": \"read_file\", \"parameters\": {\"path\": \"/src/index.ts\"}}\n```";
+    const content = '```json\n{"name": "read_file", "parameters": {"path": "/src/index.ts"}}\n```';
     const result = await parseToolCall(content, noopChatFn);
     expect(Array.isArray(result)).toBe(true);
     const calls = result as import("../ollama.js").OllamaToolCall[];
@@ -129,9 +128,7 @@ describe("Tier 2: lenient repair — P1 cases", () => {
     expect(Array.isArray(result)).toBe(true);
     const calls = result as import("../ollama.js").OllamaToolCall[];
     expect(calls[0]?.function.name).toBe("read_file");
-    expect((calls[0]?.function.arguments as Record<string, unknown>).path).toBe(
-      "/src/index.ts",
-    );
+    expect((calls[0]?.function.arguments as Record<string, unknown>).path).toBe("/src/index.ts");
   });
 
   it("infers tool name from parameter signature (write_file = path + content)", async () => {
@@ -144,6 +141,14 @@ describe("Tier 2: lenient repair — P1 cases", () => {
       path: "/out.txt",
       content: "hello world",
     });
+  });
+
+  it("infers replace_text ahead of read_file/write_file (path + old_text + new_text)", async () => {
+    const content = '{"parameters": {"path": "a.ts", "old_text": "x", "new_text": "y"}}';
+    const result = await parseToolCall(content, noopChatFn);
+    expect(Array.isArray(result)).toBe(true);
+    const calls = result as Array<{ function: { name: string } }>;
+    expect(calls[0]!.function.name).toBe("replace_text");
   });
 
   it("strips JS-style line comments", async () => {
@@ -175,10 +180,7 @@ describe("Tier 3: retry — PARSE-04", () => {
       return { role: "assistant", content: validJson };
     };
 
-    const result = await parseToolCall(
-      "I cannot produce a tool call",
-      trackingChatFn,
-    );
+    const result = await parseToolCall("I cannot produce a tool call", trackingChatFn);
     expect(callCount).toBe(3);
     expect(Array.isArray(result)).toBe(true);
     const calls = result as import("../ollama.js").OllamaToolCall[];
@@ -187,9 +189,7 @@ describe("Tier 3: retry — PARSE-04", () => {
 
   it("includes parse error text in correction prompt", async () => {
     const capturedMessages: OllamaMessage[][] = [];
-    const trackingChatFn: ChatFn = async (
-      messages: OllamaMessage[],
-    ): Promise<OllamaMessage> => {
+    const trackingChatFn: ChatFn = async (messages: OllamaMessage[]): Promise<OllamaMessage> => {
       capturedMessages.push(messages);
       return {
         role: "assistant",
@@ -214,11 +214,7 @@ describe("Tier 3: retry — PARSE-04", () => {
 
 describe("ParseFailure return — PARSE-05", () => {
   it("returns ParseFailure after 3 failed retries (never throws)", async () => {
-    const garbageChatFn = mockChatFn([
-      "still garbage",
-      "more garbage",
-      "final garbage",
-    ]);
+    const garbageChatFn = mockChatFn(["still garbage", "more garbage", "final garbage"]);
 
     let threw = false;
     let result: import("../parser.js").ParseFailure | import("../ollama.js").OllamaToolCall[];
@@ -292,10 +288,47 @@ describe("P2: unrecoverable cases — triggers retry", () => {
       };
     };
 
-    await parseToolCall(
-      "I will read the file at /src/index.ts for you.",
-      trackingChatFn,
-    );
+    await parseToolCall("I will read the file at /src/index.ts for you.", trackingChatFn);
     expect(called).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// classifyText — tool call vs broken attempt vs final answer
+// ---------------------------------------------------------------------------
+
+describe("classifyText", () => {
+  const call = '{"name":"bash","arguments":{"command":"npm test"}}';
+
+  it("accepts a whole-message call, fenced or tagged", () => {
+    expect(Array.isArray(classifyText(call))).toBe(true);
+    expect(Array.isArray(classifyText("```json\n" + call + "\n```"))).toBe(true);
+    expect(Array.isArray(classifyText(`<tool_call>${call}</tool_call>`))).toBe(true);
+  });
+
+  it("accepts a call after a prose preamble", () => {
+    expect(Array.isArray(classifyText(`I'll run the tests: ${call}`))).toBe(true);
+  });
+
+  it("treats a call quoted mid-sentence in a report as final", () => {
+    expect(classifyText(`Ran ${call} and it passed.`)).toBe("final");
+  });
+
+  it("treats an answer opening with a code fence as final", () => {
+    expect(classifyText("```diff\n- a\n+ b\n```\nApplied the change.")).toBe("final");
+  });
+
+  it("treats a JSON summary with no tool in it as final", () => {
+    expect(classifyText('{"summary": "done", "files": ["a.ts"]}')).toBe("final");
+  });
+
+  it("flags a truncated attempt after prose as broken", () => {
+    const content =
+      'I\'ll read the file first:\n```json\n{"name":"read_file","parameters":{"path": "src/x.ts"';
+    expect(classifyText(content)).toBe("broken");
+  });
+
+  it("treats plain prose as final", () => {
+    expect(classifyText("All done. I used read_file and bash.")).toBe("final");
   });
 });

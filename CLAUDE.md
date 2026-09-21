@@ -125,6 +125,7 @@ Do not attempt to fix failures."
 
 - `read_file` — read any file within `AGENT_WORKING_DIR`
 - `write_file` — write/overwrite files
+- `replace_text` — exact, unique-match edit of part of a file (preferred for small changes)
 - `list_dir` — list directory contents
 - `bash` — run shell commands (restricted mode by default: git, ls, cat, echo, grep,
   find, mkdir, cp, mv, touch, npm, node, python)

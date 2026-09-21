@@ -66,7 +66,7 @@ The agent executes the command (requires `AGENT_SHELL_MODE=restricted` or `full`
 
 **Tips:**
 - Be specific about paths — the agent works relative to `AGENT_WORKING_DIR` (defaults to the directory the server was started in)
-- Keep tasks focused — the agent stops after `AGENT_MAX_ITERATIONS` tool calls (default 10)
+- Keep tasks focused — the agent stops after `AGENT_MAX_ITERATIONS` tool-call rounds (default 20)
 - For long tasks, increase `AGENT_MAX_ITERATIONS` in your MCP config `env` block
 
 ## Configuration
@@ -78,10 +78,11 @@ All settings are controlled via environment variables. Set them in your MCP conf
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint |
 | `AGENT_MODEL` | `qwen2.5-coder:7b` | Model to use for agent tasks |
 | `AGENT_WORKING_DIR` | Current directory | Root directory for file operations |
-| `AGENT_MAX_ITERATIONS` | `10` | Maximum tool-call rounds before stopping |
-| `AGENT_TIMEOUT_SECONDS` | `30` | Timeout per bash command in seconds |
+| `AGENT_MAX_ITERATIONS` | `20` | Maximum tool-call rounds before stopping |
+| `AGENT_TIMEOUT_SECONDS` | `120` | Timeout per bash command in seconds |
 | `AGENT_SHELL_MODE` | `restricted` | `restricted` (allow-list), `full` (no restrictions, warning printed), or `none` (bash disabled) |
 | `AGENT_ALLOWED_COMMANDS` | *(empty)* | Comma-separated commands to add to the default allow-list (e.g., `rm,curl`) |
+| `AGENT_NUM_CTX` | *(Ollama default)* | Context window, sent to Ollama as `options.num_ctx`. Set it for multi-step tasks (e.g., `32768`) — a small context silently drops earlier file reads |
 
 **Default allow-list** (when `AGENT_SHELL_MODE=restricted`): git, ls, cat, echo, grep, find, mkdir, cp, mv, touch, npm, node, python.
 
@@ -105,6 +106,25 @@ Use `AGENT_ALLOWED_COMMANDS` to add commands to this list. For example, `AGENT_A
 }
 ```
 
+**Example** — a 27B-class model on a 24 GB GPU:
+
+```json
+{
+  "mcpServers": {
+    "local-agent": {
+      "command": "node",
+      "args": ["build/index.js"],
+      "env": {
+        "AGENT_MODEL": "qwen3.8:27b",
+        "AGENT_NUM_CTX": "32768"
+      }
+    }
+  }
+}
+```
+
+Check the tag with `ollama list`. Lower `AGENT_NUM_CTX` if the model plus context does not fit in VRAM.
+
 Invalid values cause the server to exit immediately with a clear error message — no silent defaults.
 
 ## Supported Models
@@ -116,6 +136,7 @@ Any Ollama model that supports tool calling works. Recommended options:
 | `qwen2.5-coder:7b` | 4.7 GB | ~6 GB | Good | Default — runs on most hardware |
 | `qwen2.5-coder:14b` | 9.0 GB | ~12 GB | Very good | Better reasoning, mid-range GPU |
 | `qwen2.5-coder:32b` | 18 GB | ~24 GB | Excellent | Best quality, requires high-end GPU |
+| `qwen3.8:27b` | 17.7 GB | ~24 GB | Excellent (native tool calls) | Multi-step edit/test tasks; set `AGENT_NUM_CTX` |
 | `llama3.1:8b` | 4.7 GB | ~6 GB | Moderate | Alternative if qwen unavailable |
 
 To upgrade: set `AGENT_MODEL=qwen2.5-coder:14b` (or `32b`) in your MCP config `env` block. Pull the model first:
@@ -157,7 +178,7 @@ The agent tried to access a file outside its working directory. Set `AGENT_WORKI
 
 **Bash commands fail on Windows**
 
-Bash execution uses Unix process groups (`kill(-pid)`) which are not available on Windows. File tools (`read_file`, `write_file`, `list_dir`) work on all platforms. Set `AGENT_SHELL_MODE=none` to disable bash entirely.
+Bash execution uses Unix process groups (`kill(-pid)`) which are not available on Windows. File tools (`read_file`, `write_file`, `replace_text`, `list_dir`) work on all platforms. Set `AGENT_SHELL_MODE=none` to disable bash entirely.
 
 ## License
 

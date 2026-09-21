@@ -20,8 +20,8 @@ afterEach(async () => {
 });
 
 describe("TOOL_DEFINITIONS", () => {
-  it("has 4 tool definitions", () => {
-    expect(TOOL_DEFINITIONS).toHaveLength(4);
+  it("has 5 tool definitions", () => {
+    expect(TOOL_DEFINITIONS).toHaveLength(5);
   });
 
   it("each has a description longer than 50 characters", () => {
@@ -33,18 +33,39 @@ describe("TOOL_DEFINITIONS", () => {
 
 describe("read_file", () => {
   it("reads existing file", async () => {
-    const result = await executeTool("read_file", { path: "test.txt" }, tempDir, shellMode, allowedCommands, timeoutMs);
+    const result = await executeTool(
+      "read_file",
+      { path: "test.txt" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
     expect(result.success).toBe(true);
     expect(result.output).toBe("hello world");
   });
 
   it("fails on missing file", async () => {
-    const result = await executeTool("read_file", { path: "nope.txt" }, tempDir, shellMode, allowedCommands, timeoutMs);
+    const result = await executeTool(
+      "read_file",
+      { path: "nope.txt" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
     expect(result.success).toBe(false);
   });
 
   it("rejects path outside working dir", async () => {
-    const result = await executeTool("read_file", { path: "../../etc/passwd" }, tempDir, shellMode, allowedCommands, timeoutMs);
+    const result = await executeTool(
+      "read_file",
+      { path: "../../etc/passwd" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
     expect(result.success).toBe(false);
     expect(result.output).toContain("path not allowed");
   });
@@ -52,21 +73,151 @@ describe("read_file", () => {
 
 describe("write_file", () => {
   it("writes new file", async () => {
-    const result = await executeTool("write_file", { path: "new.txt", content: "hello" }, tempDir, shellMode, allowedCommands, timeoutMs);
+    const result = await executeTool(
+      "write_file",
+      { path: "new.txt", content: "hello" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
     expect(result.success).toBe(true);
     const written = await fs.readFile(path.join(tempDir, "new.txt"), "utf-8");
     expect(written).toBe("hello");
   });
 
   it("creates intermediate directories", async () => {
-    const result = await executeTool("write_file", { path: "deep/nested/file.txt", content: "nested" }, tempDir, shellMode, allowedCommands, timeoutMs);
+    const result = await executeTool(
+      "write_file",
+      { path: "deep/nested/file.txt", content: "nested" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
     expect(result.success).toBe(true);
     const written = await fs.readFile(path.join(tempDir, "deep", "nested", "file.txt"), "utf-8");
     expect(written).toBe("nested");
   });
 
   it("rejects path outside working dir", async () => {
-    const result = await executeTool("write_file", { path: "../../evil.txt", content: "bad" }, tempDir, shellMode, allowedCommands, timeoutMs);
+    const result = await executeTool(
+      "write_file",
+      { path: "../../evil.txt", content: "bad" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
+    expect(result.success).toBe(false);
+    expect(result.output).toContain("path not allowed");
+  });
+});
+
+describe("replace_text", () => {
+  const readTest = () => fs.readFile(path.join(tempDir, "test.txt"), "utf-8");
+
+  it("replaces a unique match", async () => {
+    const result = await executeTool(
+      "replace_text",
+      { path: "test.txt", old_text: "world", new_text: "there" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
+    expect(result.success).toBe(true);
+    expect(await readTest()).toBe("hello there");
+  });
+
+  it("writes new_text literally (no $ substitution patterns)", async () => {
+    const result = await executeTool(
+      "replace_text",
+      { path: "test.txt", old_text: "world", new_text: "$&x" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
+    expect(result.success).toBe(true);
+    expect(await readTest()).toBe("hello $&x");
+  });
+
+  it("fails when old_text is not found", async () => {
+    const result = await executeTool(
+      "replace_text",
+      { path: "test.txt", old_text: "zzz", new_text: "y" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
+    expect(result.success).toBe(false);
+    expect(result.output).toContain("not found");
+    expect(await readTest()).toBe("hello world");
+  });
+
+  it("fails when old_text is ambiguous", async () => {
+    await fs.writeFile(path.join(tempDir, "test.txt"), "a a", "utf-8");
+    const result = await executeTool(
+      "replace_text",
+      { path: "test.txt", old_text: "a", new_text: "b" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
+    expect(result.success).toBe(false);
+    expect(result.output).toContain("2 occurrences");
+    expect(await readTest()).toBe("a a");
+  });
+
+  it("fails when new_text is missing, but allows an empty string (deletion)", async () => {
+    const missing = await executeTool(
+      "replace_text",
+      { path: "test.txt", old_text: " world" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
+    expect(missing.success).toBe(false);
+    expect(await readTest()).toBe("hello world");
+
+    const deletion = await executeTool(
+      "replace_text",
+      { path: "test.txt", old_text: " world", new_text: "" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
+    expect(deletion.success).toBe(true);
+    expect(await readTest()).toBe("hello");
+  });
+
+  it("fails on empty old_text", async () => {
+    const result = await executeTool(
+      "replace_text",
+      { path: "test.txt", old_text: "", new_text: "y" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
+    expect(result.success).toBe(false);
+    expect(await readTest()).toBe("hello world");
+  });
+
+  it("rejects path outside working dir", async () => {
+    const result = await executeTool(
+      "replace_text",
+      { path: "../../evil.txt", old_text: "a", new_text: "b" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
     expect(result.success).toBe(false);
     expect(result.output).toContain("path not allowed");
   });
@@ -74,81 +225,150 @@ describe("write_file", () => {
 
 describe("list_dir", () => {
   it("lists directory contents", async () => {
-    const result = await executeTool("list_dir", { path: "." }, tempDir, shellMode, allowedCommands, timeoutMs);
+    const result = await executeTool(
+      "list_dir",
+      { path: "." },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
     expect(result.success).toBe(true);
     expect(result.output).toContain("test.txt");
     expect(result.output).toContain("f");
   });
 
   it("fails on missing directory", async () => {
-    const result = await executeTool("list_dir", { path: "nope" }, tempDir, shellMode, allowedCommands, timeoutMs);
+    const result = await executeTool(
+      "list_dir",
+      { path: "nope" },
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
     expect(result.success).toBe(false);
   });
 });
 
 describe("bash", () => {
   it.skipIf(process.platform === "win32")("executes allowed command", async () => {
-    const result = await executeTool("bash", { command: "echo hello" }, tempDir, "restricted", allowedCommands, timeoutMs);
+    const result = await executeTool(
+      "bash",
+      { command: "echo hello" },
+      tempDir,
+      "restricted",
+      allowedCommands,
+      timeoutMs,
+    );
     expect(result.success).toBe(true);
     expect(result.output).toContain("hello");
   });
 
-  it.skipIf(process.platform === "win32")("rejects blocked command in restricted mode", async () => {
-    const result = await executeTool("bash", { command: "rm -rf /" }, tempDir, "restricted", allowedCommands, timeoutMs);
-    expect(result.success).toBe(false);
-    expect(result.output).toContain("command not allowed");
+  it.skipIf(process.platform === "win32")(
+    "rejects blocked command in restricted mode",
+    async () => {
+      const result = await executeTool(
+        "bash",
+        { command: "rm -rf /" },
+        tempDir,
+        "restricted",
+        allowedCommands,
+        timeoutMs,
+      );
+      expect(result.success).toBe(false);
+      expect(result.output).toContain("command not allowed");
+    },
+  );
+
+  it.skipIf(process.platform === "win32")("strips ANSI colour codes from output", async () => {
+    const result = await executeTool(
+      "bash",
+      { command: "echo -e '\\033[31mred\\033[39m plain'" },
+      tempDir,
+      "restricted",
+      allowedCommands,
+      timeoutMs,
+    );
+    expect(result.success).toBe(true);
+    expect(result.output.trim()).toBe("red plain");
   });
 
   it("disabled in none mode", async () => {
-    const result = await executeTool("bash", { command: "echo hi" }, tempDir, "none", allowedCommands, timeoutMs);
+    const result = await executeTool(
+      "bash",
+      { command: "echo hi" },
+      tempDir,
+      "none",
+      allowedCommands,
+      timeoutMs,
+    );
     expect(result.success).toBe(false);
     expect(result.output).toContain("bash is disabled");
   });
 
   it.skipIf(process.platform === "win32")("appends warning in full mode", async () => {
-    const result = await executeTool("bash", { command: "echo hi" }, tempDir, "full", allowedCommands, timeoutMs);
+    const result = await executeTool(
+      "bash",
+      { command: "echo hi" },
+      tempDir,
+      "full",
+      allowedCommands,
+      timeoutMs,
+    );
     expect(result.success).toBe(true);
     expect(result.output).toContain("shell mode: full");
   });
 
-  it.skipIf(process.platform === "win32")("kills grandchild processes on timeout", { timeout: 15000 }, async () => {
-    // Spawn a bash command that forks a grandchild sleep process
-    // The outer bash prints the grandchild PID then waits
-    const result = await executeTool(
-      "bash",
-      { command: 'bash -c "sleep 60 & echo \\$!; wait"' },
-      tempDir,
-      "full",
-      allowedCommands,
-      500, // 500ms timeout — grandchild won't finish in time
-    );
+  it.skipIf(process.platform === "win32")(
+    "kills grandchild processes on timeout",
+    { timeout: 15000 },
+    async () => {
+      // Spawn a bash command that forks a grandchild sleep process
+      // The outer bash prints the grandchild PID then waits
+      const result = await executeTool(
+        "bash",
+        { command: 'bash -c "sleep 60 & echo \\$!; wait"' },
+        tempDir,
+        "full",
+        allowedCommands,
+        500, // 500ms timeout — grandchild won't finish in time
+      );
 
-    expect(result.success).toBe(false);
-    expect(result.output).toContain("timed out");
+      expect(result.success).toBe(false);
+      expect(result.output).toContain("timed out");
 
-    // Extract the grandchild PID from stdout (printed before timeout killed the group)
-    const pidMatch = result.output.match(/^(\d+)$/m);
-    if (pidMatch) {
-      const grandchildPid = parseInt(pidMatch[1], 10);
-      // Give OS a moment to clean up
-      await new Promise((r) => setTimeout(r, 200));
-      // Verify grandchild is dead
-      let alive: boolean;
-      try {
-        process.kill(grandchildPid, 0); // signal 0 = existence check
-        alive = true;
-      } catch {
-        // ESRCH = process doesn't exist = success
-        alive = false;
+      // Extract the grandchild PID from stdout (printed before timeout killed the group)
+      const pidMatch = result.output.match(/^(\d+)$/m);
+      if (pidMatch) {
+        const grandchildPid = parseInt(pidMatch[1], 10);
+        // Give OS a moment to clean up
+        await new Promise((r) => setTimeout(r, 200));
+        // Verify grandchild is dead
+        let alive: boolean;
+        try {
+          process.kill(grandchildPid, 0); // signal 0 = existence check
+          alive = true;
+        } catch {
+          // ESRCH = process doesn't exist = success
+          alive = false;
+        }
+        expect(alive).toBe(false);
       }
-      expect(alive).toBe(false);
-    }
-  });
+    },
+  );
 });
 
 describe("unknown tool", () => {
   it("returns error for unknown tool", async () => {
-    const result = await executeTool("fake_tool", {}, tempDir, shellMode, allowedCommands, timeoutMs);
+    const result = await executeTool(
+      "fake_tool",
+      {},
+      tempDir,
+      shellMode,
+      allowedCommands,
+      timeoutMs,
+    );
     expect(result.success).toBe(false);
     expect(result.output).toContain("unknown tool");
   });

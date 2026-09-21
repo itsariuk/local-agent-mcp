@@ -61,6 +61,32 @@ export const TOOL_DEFINITIONS: OllamaToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "replace_text",
+      description:
+        "Replace one exact occurrence of old_text with new_text in an existing file. old_text must match the file exactly, including whitespace, and must appear exactly once — include surrounding lines to make it unique. Prefer this over write_file when changing part of a file.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "File path relative to working directory",
+          },
+          old_text: {
+            type: "string",
+            description: "The exact text to replace; must occur exactly once",
+          },
+          new_text: {
+            type: "string",
+            description: "The text to put in its place",
+          },
+        },
+        required: ["path", "old_text", "new_text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "list_dir",
       description:
         "List the contents of a directory with details: file name, type (file/dir), size in bytes, and last modified date. Use this to explore project structure before reading specific files.",
@@ -81,7 +107,7 @@ export const TOOL_DEFINITIONS: OllamaToolDefinition[] = [
     function: {
       name: "bash",
       description:
-        "Execute a shell command and return its stdout and stderr. Commands are restricted to a safe allow-list by default: git, ls, cat, echo, grep, find, mkdir, cp, mv, touch, npm, node, python. Use this to run builds, tests, git operations, and explore the filesystem.",
+        "Execute a shell command and return its stdout and stderr. Commands are restricted to a safe allow-list by default: git, ls, cat, echo, grep, find, mkdir, cp, mv, touch, npm, node, python. Use this to run builds, tests, git operations, and explore the filesystem. Use replace_text or write_file for edits, not shell redirection.",
       parameters: {
         type: "object",
         properties: {
@@ -96,6 +122,10 @@ export const TOOL_DEFINITIONS: OllamaToolDefinition[] = [
   },
 ];
 
+// Colour codes are noise (and tokens) for the model and the supervisor.
+// Built from a char code: a literal escape in a regex trips no-control-regex.
+const ANSI_COLOR = new RegExp(String.fromCharCode(27) + "\\[[0-9;]*m", "g");
+
 // ---------------------------------------------------------------------------
 // Tool result type
 // ---------------------------------------------------------------------------
@@ -109,20 +139,14 @@ export interface ToolResult {
 // Individual tool executors
 // ---------------------------------------------------------------------------
 
-async function readFile(
-  args: Record<string, unknown>,
-  workingDir: string,
-): Promise<ToolResult> {
+async function readFile(args: Record<string, unknown>, workingDir: string): Promise<ToolResult> {
   const filePath = String(args.path ?? "");
   const safePath = assertPathSafe(filePath, workingDir);
   const content = await fs.readFile(safePath, "utf-8");
   return { success: true, output: content };
 }
 
-async function writeFile(
-  args: Record<string, unknown>,
-  workingDir: string,
-): Promise<ToolResult> {
+async function writeFile(args: Record<string, unknown>, workingDir: string): Promise<ToolResult> {
   const filePath = String(args.path ?? "");
   const content = String(args.content ?? "");
   const safePath = assertPathSafe(filePath, workingDir);
@@ -132,10 +156,38 @@ async function writeFile(
   return { success: true, output: `wrote ${bytes} bytes to ${filePath}` };
 }
 
-async function listDir(
-  args: Record<string, unknown>,
-  workingDir: string,
-): Promise<ToolResult> {
+async function replaceText(args: Record<string, unknown>, workingDir: string): Promise<ToolResult> {
+  const filePath = String(args.path ?? "");
+  const oldText = String(args.old_text ?? "");
+  const safePath = assertPathSafe(filePath, workingDir);
+  if (oldText === "") {
+    throw new Error("old_text must not be empty");
+  }
+  // Empty new_text is a valid deletion; a missing one is a malformed call
+  if (typeof args.new_text !== "string") {
+    throw new Error("new_text is required (use an empty string to delete)");
+  }
+  const newText = args.new_text;
+  const content = await fs.readFile(safePath, "utf-8");
+  const occurrences = content.split(oldText).length - 1;
+  if (occurrences === 0) {
+    throw new Error(`old_text not found in ${filePath}`);
+  }
+  if (occurrences > 1) {
+    throw new Error(
+      `old_text has ${occurrences} occurrences in ${filePath}; add surrounding context to make it unique`,
+    );
+  }
+  // Function form: a string replacement would interpret $& / $1 in newText
+  await fs.writeFile(
+    safePath,
+    content.replace(oldText, () => newText),
+    "utf-8",
+  );
+  return { success: true, output: `replaced 1 occurrence in ${filePath}` };
+}
+
+async function listDir(args: Record<string, unknown>, workingDir: string): Promise<ToolResult> {
   const dirPath = String(args.path ?? ".");
   const safePath = assertPathSafe(dirPath, workingDir);
   const entries = await fs.readdir(safePath, { withFileTypes: true });
@@ -206,7 +258,7 @@ async function bashExec(
         return;
       }
 
-      let output = truncateOutput(stdout + stderr);
+      let output = truncateOutput((stdout + stderr).replace(ANSI_COLOR, ""));
 
       if (shellMode === "full") {
         output += "\n[shell mode: full — no restrictions applied]";
@@ -249,16 +301,12 @@ export async function executeTool(
         return await readFile(args, workingDir);
       case "write_file":
         return await writeFile(args, workingDir);
+      case "replace_text":
+        return await replaceText(args, workingDir);
       case "list_dir":
         return await listDir(args, workingDir);
       case "bash":
-        return await bashExec(
-          args,
-          workingDir,
-          shellMode,
-          allowedCommands,
-          timeoutMs,
-        );
+        return await bashExec(args, workingDir, shellMode, allowedCommands, timeoutMs);
       default:
         return { success: false, output: `unknown tool: ${name}` };
     }

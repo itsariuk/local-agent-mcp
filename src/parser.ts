@@ -24,14 +24,7 @@ export interface ParseFailure {
 // Constants
 // ---------------------------------------------------------------------------
 
-const NAME_ALIASES = [
-  "name",
-  "tool_name",
-  "function",
-  "action",
-  "tool",
-  "function_name",
-] as const;
+const NAME_ALIASES = ["name", "tool_name", "function", "action", "tool", "function_name"] as const;
 
 const PARAMS_ALIASES = [
   "parameters",
@@ -44,7 +37,9 @@ const PARAMS_ALIASES = [
 ] as const;
 
 const TOOL_SIGNATURES: Record<string, string[]> = {
-  // write_file checked BEFORE read_file — more specific (2 required params vs 1)
+  // Most specific first: inferToolName takes the first signature whose keys are
+  // all present, and read_file/list_dir need only "path"
+  replace_text: ["path", "old_text", "new_text"],
   write_file: ["path", "content"],
   read_file: ["path"],
   list_dir: ["path"],
@@ -176,8 +171,7 @@ function inferToolName(params: Record<string, unknown>): string | null {
 function normalizeToolCall(
   raw: unknown,
 ): { name: string; parameters: Record<string, unknown> } | null {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw))
-    return null;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
   const obj = raw as Record<string, unknown>;
 
   // Resolve name
@@ -254,8 +248,7 @@ function pickBestToolCall(
   // Prefer candidates that normalize AND have a known tool name
   for (const candidate of candidates) {
     const normalized = normalizeToolCall(candidate);
-    if (normalized !== null && knownTools.has(normalized.name))
-      return normalized;
+    if (normalized !== null && knownTools.has(normalized.name)) return normalized;
   }
   // Fallback: first that normalizes at all
   for (const candidate of candidates) {
@@ -314,6 +307,31 @@ function extractToolCalls(raw: string): OllamaToolCall[] | null {
 }
 
 // ---------------------------------------------------------------------------
+// Text classification (no retry) — tool call, broken attempt, or final answer
+// ---------------------------------------------------------------------------
+
+const BROKEN_ATTEMPT = new RegExp(`<tool_call>|"(${Object.keys(TOOL_SIGNATURES).join("|")})"`);
+
+/**
+ * Decide what a message without native tool_calls is.
+ *
+ * - A parseable call counts only when the JSON sits at the start or end of the
+ *   message. JSON in the middle of a sentence is the model quoting a call in
+ *   its report, and executing it would re-run the command.
+ * - "broken" means the text names a tool (or uses <tool_call>) but nothing
+ *   parsed, wherever the attempt sits — that is worth a correction retry.
+ * - Everything else, including answers that open with a code fence, is final.
+ */
+export function classifyText(raw: string): OllamaToolCall[] | "broken" | "final" {
+  const calls = extractToolCalls(raw);
+  if (calls !== null) {
+    const bare = raw.replace(/```\w*|<\/?tool_call>/g, "").trim();
+    return /^[{[]|[}\]]$/.test(bare) ? calls : "final";
+  }
+  return BROKEN_ATTEMPT.test(raw) ? "broken" : "final";
+}
+
+// ---------------------------------------------------------------------------
 // Parse error description helper
 // ---------------------------------------------------------------------------
 
@@ -338,10 +356,7 @@ function getParseError(content: string): string {
 // Correction prompt builder
 // ---------------------------------------------------------------------------
 
-function buildCorrectionMessages(
-  badOutput: string,
-  parseError: string,
-): OllamaMessage[] {
+function buildCorrectionMessages(badOutput: string, parseError: string): OllamaMessage[] {
   const correctionText =
     `Your previous response could not be parsed as a tool call.\n\n` +
     `Here is what you returned:\n<previous_response>\n${badOutput}\n</previous_response>\n\n` +

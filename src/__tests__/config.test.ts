@@ -14,6 +14,7 @@ const ENV_KEYS = [
   "AGENT_TIMEOUT_SECONDS",
   "AGENT_SHELL_MODE",
   "AGENT_ALLOWED_COMMANDS",
+  "AGENT_NUM_CTX",
 ] as const;
 
 function snapshotEnv(): Record<string, string | undefined> {
@@ -62,13 +63,28 @@ describe("loadConfig", () => {
     expect(config.ollamaHost).toBe("http://localhost:11434");
     expect(config.model).toBe("qwen2.5-coder:7b");
     expect(config.workingDir).toBe(process.cwd());
-    expect(config.maxIterations).toBe(10);
-    expect(config.timeoutMs).toBe(30_000);
+    expect(config.maxIterations).toBe(20);
+    expect(config.timeoutMs).toBe(120_000);
+    expect(config.numCtx).toBeUndefined();
     expect(config.shellMode).toBe("restricted");
     // All 13 default commands present
     for (const cmd of DEFAULT_ALLOWED_COMMANDS) {
       expect(config.allowedCommands).toContain(cmd);
     }
+  });
+
+  // -------------------------------------------------------------------
+  // CONF-08: AGENT_NUM_CTX
+  // -------------------------------------------------------------------
+
+  it("AGENT_NUM_CTX=32768 sets numCtx", () => {
+    setup({ AGENT_NUM_CTX: "32768" });
+    expect(loadConfig().numCtx).toBe(32768);
+  });
+
+  it("AGENT_NUM_CTX=abc throws ConfigError", () => {
+    setup({ AGENT_NUM_CTX: "abc" });
+    expect(() => loadConfig()).toThrow(ConfigError);
   });
 
   // -------------------------------------------------------------------
