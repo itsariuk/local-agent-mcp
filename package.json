@@ -4,11 +4,26 @@
   "description": "Run local AI agents via Claude Code -- delegates tasks to Ollama with file and shell tools",
   "type": "module",
   "main": "build/index.js",
+  "bin": {
+    "local-agent-mcp": "build/index.js"
+  },
+  "files": [
+    "build",
+    "CLAUDE.md",
+    "README.md",
+    "LICENSE.txt"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/itsariuk/local-agent-mcp.git"
+  },
   "engines": {
     "node": ">=20.3"
   },
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build && npm test",
     "start": "node build/index.js",
     "dev": "tsx --watch src/index.ts",
     "typecheck": "tsc --noEmit",

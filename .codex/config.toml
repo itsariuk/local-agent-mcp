@@ -1,0 +1,7 @@
+# Project-scoped Codex registration for this repo (trusted projects only).
+# Mirrors .mcp.json for Claude Code. Build first: npm install && npm run build
+
+[mcp_servers.local-agent]
+command = "node"
+args = ["build/index.js"]
+tool_timeout_sec = 1200    # jobs run up to AGENT_JOB_TIMEOUT_SECONDS (900) plus queue time

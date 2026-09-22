@@ -20,36 +20,74 @@ What you get:
 
 ## Installation
 
+The server is a stdio MCP server, so it is registered with `claude mcp add`. Pick one:
+
+**A. No clone — run from GitHub via `npx`** (recommended):
+
+```bash
+claude mcp add --scope user local-agent \
+  --env AGENT_MODEL=qwen3.8:27b \
+  --env AGENT_NUM_CTX=32768 \
+  -- npx -y github:itsariuk/local-agent-mcp
+```
+
+The first start takes a minute (npm fetches and builds the package); later starts are cached. If that first start trips Claude Code's server-startup timeout, run it once as `MCP_TIMEOUT=180000 claude` (milliseconds). Point at a remote Ollama with `--env OLLAMA_HOST=http://<gpu-host>:11434`, or at several workers with `--env AGENT_WORKERS=...` — every variable in [Configuration](#configuration) can be passed this way.
+
+**B. From a clone** (for development, or to pin a build):
+
 ```bash
 git clone https://github.com/itsariuk/local-agent-mcp.git
 cd local-agent-mcp
-npm install
-npm run build
+npm install          # also builds (prepare)
+claude mcp add --scope user local-agent -- node "$PWD/build/index.js"
 ```
 
-## Claude Code Registration
+Inside the clone itself the included `.mcp.json` registers the server at project scope automatically, so a plain `claude` in that directory already has it.
 
-The repo includes a `.mcp.json` file that Claude Code detects automatically. After building, Claude Code will find the `local-agent` tool when opened in the project directory.
+**Scopes.** `--scope user` makes the server available in every project; omit it for the current project only (stored in `~/.claude.json`), or use `--scope project` to write a shareable `.mcp.json`. Manage it afterwards with `claude mcp list`, `claude mcp get local-agent`, `claude mcp remove local-agent`, and `/mcp` inside Claude Code.
 
-**Manual registration** (if using a different directory or global config):
+### Codex
 
-Add to your Claude Code MCP settings:
+Codex registers stdio servers the same way:
+
+```bash
+codex mcp add local-agent \
+  --env AGENT_MODEL=qwen3.8:27b \
+  --env AGENT_NUM_CTX=32768 \
+  -- npx -y github:itsariuk/local-agent-mcp
+```
+
+Then raise two timeouts in `~/.codex/config.toml` — Codex gives each tool call **60 seconds by default**, and a delegated job routinely runs for minutes:
+
+```toml
+[mcp_servers.local-agent]
+command = "npx"
+args = ["-y", "github:itsariuk/local-agent-mcp"]
+startup_timeout_sec = 180   # first start fetches and builds the package
+tool_timeout_sec = 1200     # jobs run up to AGENT_JOB_TIMEOUT_SECONDS (900) plus queue time
+
+[mcp_servers.local-agent.env]
+AGENT_MODEL = "qwen3.8:27b"
+AGENT_NUM_CTX = "32768"
+```
+
+Inside a clone, the included `.codex/config.toml` does the same at project scope (Codex applies it to trusted projects only). `codex mcp list` shows what is registered.
+
+**Other MCP clients** get the same server with the equivalent of:
 
 ```json
 {
   "mcpServers": {
     "local-agent": {
-      "command": "node",
-      "args": ["/absolute/path/to/local-agent-mcp/build/index.js"],
-      "env": {
-        "AGENT_MODEL": "qwen2.5-coder:7b"
-      }
+      "command": "npx",
+      "args": ["-y", "github:itsariuk/local-agent-mcp"],
+      "env": { "AGENT_MODEL": "qwen3.8:27b" }
     }
   }
 }
 ```
 
-The `env` block is optional — see [Configuration](#configuration) for all available settings.
+Whatever the client, give tool calls at least 20 minutes: a job that hits the client's timeout is killed from outside and returns nothing, whereas `timeout_seconds` on the call itself returns the work done so far.
 
 ## Usage
 
