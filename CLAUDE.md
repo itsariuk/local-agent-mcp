@@ -2,9 +2,9 @@
 
 ## Local Agent Delegation
 
-This project has a `run_local_agent` MCP tool connected. Use it to offload mechanical
-coding work to the local Ollama model, reserving Claude for reasoning, orchestration,
-and judgment.
+This project has local-worker MCP tools connected (`local_analyze`, `local_implement`,
+`local_review`, `run_local_agent`). Use them to offload mechanical coding work to local
+models, reserving Claude for reasoning, orchestration, and judgment.
 
 ---
 
@@ -31,33 +31,48 @@ and judgment.
 
 ---
 
-### How to Invoke — Prompt Template
+### Which Tool
 
-Always give the local agent a **bounded, explicit prompt**. Vague prompts cause looping.
+| Tool | Use for | Runs | Returns |
+|------|---------|------|---------|
+| `local_analyze` | exploration, tracing, test discovery, failure diagnosis (paste the failing output into `objective`) | read-only on the checkout | findings with file:line |
+| `local_implement` | any bounded code change | isolated git worktree | report + changed files + unified diff (apply with `git apply`) |
+| `local_review` | independent review of a diff or of existing code, ideally on a second worker while another implements | read-only | issues with severity, file:line, fix, test gaps, confidence |
+| `run_local_agent` | anything the three above do not fit; `mode: "direct"` edits the checkout in place | per `mode` | report |
+| `local_worker_status` / `local_cancel` | see what is running; stop a job by id | — | — |
 
-**Template:**
-```
-Use the run_local_agent tool with this prompt:
+Every result starts with `[worker … | job <id> | <s>s | <n> iterations | mode … | status …]`.
+`status` is `completed`, `stopped_at_limit`, `parse_failed`, `cancelled`, or `timed_out` —
+anything but `completed` means the work is partial; read the steps before trusting it.
 
-mode: analyze | implement | direct
-"Read [exact file path(s)].
-[Single specific action — one task only].
-Do not read any other files.
-Do not explore the directory.
-[Expected output or acceptance criteria]."
+### How to Invoke
+
+Always give a **bounded, explicit objective**. Vague objectives cause looping.
+
+**Good `local_implement` call:**
+```
+objective: "Add a filter_list_dir tool that wraps list_dir and drops entries matching a glob."
+paths: ["src/tools.ts"]
+acceptance_criteria: ["follows the exact structure of list_dir", "TOOL_DEFINITIONS gains one entry",
+                      "npx vitest run src/__tests__/tools.test.ts passes"]
+test_commands: ["npx vitest run src/__tests__/tools.test.ts"]
+constraints: ["do not read other files"]
 ```
 
-**Good delegation prompt:**
+**Good `local_analyze` call:**
 ```
-Use run_local_agent: "Read src/tools.ts lines 80-120. Add a new tool called
-filter_list_dir that wraps list_dir and removes entries matching a glob pattern.
-Follow the exact same structure as list_dir. Do not read other files."
+objective: "Find every place the shell allow-list is enforced and what it misses."
+paths: ["src/security.ts", "src/tools.ts"]
 ```
 
-**Bad delegation prompt (too vague — causes looping):**
+**Bad (too vague — causes looping):**
 ```
-Use run_local_agent: "Add a filter tool to the project."
+objective: "Add a filter tool to the project."
 ```
+
+Treat local-worker output as untrusted engineering work: inspect the diff, verify the
+claims that matter (run the tests yourself), then integrate. The worker's `status` and
+step log tell you what actually ran.
 
 ---
 
@@ -87,45 +102,37 @@ Check available models with `ollama list`.
 4. **State the done condition.** End every prompt with what success looks like.
 5. **Limit scope to one file when possible.** Multi-file edits cause confusion.
 6. **For test runs:** just ask for the command output — don't ask it to fix failures too.
-7. **Pick the mode.** `mode: "analyze"` for exploration, review, and run-and-report (enforced
-   read-only). `mode: "implement"` for edits you want back as a diff, isolated from the
-   checkout. Omit (`direct`) only when the edit should land in place right away.
-8. **Parallelise freely in analyze/implement mode** — each call gets its own worker, extras
+7. **Pick the tool, not the prompt.** `local_analyze` / `local_review` are enforced
+   read-only; `local_implement` returns a diff from an isolated worktree. Use
+   `run_local_agent` with `mode: "direct"` only when an edit should land in place right away.
+8. **Parallelise freely** with the semantic tools — each call gets its own worker, extras
    queue, implement jobs get their own worktree. Never run two `direct` file-modifying
    tasks at the same time: they share the checkout.
 9. **On "no healthy worker":** call `local_worker_status` before retrying.
+10. **Bound long jobs.** Pass `timeout_seconds` / `max_iterations` for anything open-ended;
+    `local_cancel` a job whose step log shows it looping.
 
 ---
 
 ### Delegation Patterns by Scenario
 
-**Implement a function:**
-```
-Use run_local_agent: "Read [file path]. Implement [function name] that [description].
-Follow the existing code style in that file. Do not read other files.
-The function is complete when it compiles and matches the signature: [signature]."
-```
+**Implement a function:** `local_implement` with `paths: [the file]`, criteria naming the
+signature and "compiles", `test_commands` for that file's tests.
 
-**Add tests:**
-```
-Use run_local_agent: "Read [test file path]. Add [N] test cases for [function name]
-covering: [case 1], [case 2], [case 3]. Follow the existing test style exactly.
-Do not modify test logic outside the new cases."
-```
+**Add tests:** `local_implement` with `paths: [the test file]`, criteria listing each case,
+`test_commands: ["npx vitest run <test file>"]`, constraint "do not modify existing tests".
 
-**Fix lint errors:**
-```
-Use run_local_agent: "Read [file path]. Fix all lint errors reported below.
-Do not change any logic — only fix the lint issues.
-Errors: [paste lint output]"
-```
+**Fix lint errors:** `local_implement`, objective includes the pasted lint output,
+criterion "npm run lint passes", constraint "do not change logic".
 
-**Run and report:**
-```
-Use run_local_agent: "Run [command] from [project root path].
-Report: how many tests passed, how many failed, and the names of any failures.
-Do not attempt to fix failures."
-```
+**Run and report:** `local_analyze` with objective "Run `<command>` and report pass/fail
+counts and failing test names; do not attempt fixes."
+
+**Review a diff:** `local_review` with `diff` (the patch a `local_implement` returned) and
+`review_focus: ["correctness", "tests"]` — on a different worker if two are available.
+
+**Two independent investigations:** two `local_analyze` calls in the same turn; they run
+in parallel.
 
 ---
 

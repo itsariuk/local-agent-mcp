@@ -37,6 +37,9 @@ function runGit(cwd: string, args: string[], input?: string): Promise<string> {
     child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
     child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
     child.on("error", reject);
+    // git may exit before stdin is written (rev-parse never reads it): EPIPE on
+    // stdin is harmless, and an unhandled 'error' here would crash the server
+    child.stdin.on("error", () => {});
     child.on("close", (code) => {
       if (code === 0) resolve(stdout);
       else reject(new Error(`git ${args[0]} failed (${code}): ${stderr.trim()}`));

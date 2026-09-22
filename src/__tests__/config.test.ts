@@ -16,6 +16,7 @@ const ENV_KEYS = [
   "AGENT_ALLOWED_COMMANDS",
   "AGENT_NUM_CTX",
   "AGENT_WORKERS",
+  "AGENT_JOB_TIMEOUT_SECONDS",
 ] as const;
 
 function snapshotEnv(): Record<string, string | undefined> {
@@ -69,6 +70,7 @@ describe("loadConfig", () => {
     expect(config.maxIterations).toBe(20);
     expect(config.timeoutMs).toBe(120_000);
     expect(config.numCtx).toBeUndefined();
+    expect(config.jobTimeoutMs).toBe(900_000);
     expect(config.shellMode).toBe("restricted");
     // All default commands present
     for (const cmd of DEFAULT_ALLOWED_COMMANDS) {
@@ -99,6 +101,20 @@ describe("loadConfig", () => {
     const config = loadConfig();
     expect(config.workers).toHaveLength(1);
     expect(config.workers[0]!.host).toBe("http://custom:1234");
+  });
+
+  // -------------------------------------------------------------------
+  // CONF-10: AGENT_JOB_TIMEOUT_SECONDS
+  // -------------------------------------------------------------------
+
+  it("AGENT_JOB_TIMEOUT_SECONDS=60 sets jobTimeoutMs", () => {
+    setup({ AGENT_JOB_TIMEOUT_SECONDS: "60" });
+    expect(loadConfig().jobTimeoutMs).toBe(60_000);
+  });
+
+  it("AGENT_JOB_TIMEOUT_SECONDS=abc throws ConfigError", () => {
+    setup({ AGENT_JOB_TIMEOUT_SECONDS: "abc" });
+    expect(() => loadConfig()).toThrow(ConfigError);
   });
 
   // -------------------------------------------------------------------

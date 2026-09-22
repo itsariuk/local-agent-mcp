@@ -52,8 +52,11 @@ export const DEFAULT_ALLOWED_COMMANDS: readonly string[] = [
 
 // Split on shell control operators so every command in a chain is checked.
 // A lone `&` (background) counts too, except inside `>&`/`<&` descriptor
-// redirects. Quoted operators are split as well — this errs on the side of rejecting.
-const COMMAND_SEPARATORS = /\|\|?|&&|(?<![<>])&|;|\n/;
+// redirects. An operator escaped by an odd run of backslashes (`grep "a\|b"`,
+// `find -exec {} \;`) is never a separator; `\\|` is an escaped backslash
+// followed by a live pipe. Quoted operators are still split — this errs on the
+// side of rejecting.
+const COMMAND_SEPARATORS = /(?<!(?<!\\)(?:\\\\)*\\)(?:\|\|?|&&|(?<![<>])&|;)|\n/;
 // `$(...)`, backticks, and process substitution `<(...)` / `>(...)`
 const COMMAND_SUBSTITUTION = /\$\(|`|[<>]\(/;
 

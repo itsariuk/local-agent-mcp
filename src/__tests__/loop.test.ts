@@ -4,7 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import { chatWithOllama } from "../ollama.js";
 import type { OllamaChatResponse, OllamaMessage } from "../ollama.js";
-import { runAgentLoop, formatAgentResult, formatDiff } from "../loop.js";
+import { runAgentLoop, formatAgentResult, formatDiff, jobStatus } from "../loop.js";
 import type { AgentResult } from "../loop.js";
 
 vi.mock("../ollama.js", () => ({ chatWithOllama: vi.fn() }));
@@ -23,7 +23,15 @@ const readCall = (file: string) =>
 
 let tempDir: string;
 
-function run(extra: { numCtx?: number; readOnly?: boolean } = {}) {
+function run(
+  extra: {
+    numCtx?: number;
+    readOnly?: boolean;
+    signal?: AbortSignal;
+    shellMode?: "restricted" | "none";
+    allowedCommands?: string[];
+  } = {},
+) {
   return runAgentLoop({
     prompt: "do the thing",
     model: "m",
@@ -151,6 +159,81 @@ describe("runAgentLoop", () => {
     await expect(fs.access(path.join(tempDir, "x.txt"))).rejects.toThrow();
   });
 
+  it("keeps the steps and reports cancelled when aborted mid-run", async () => {
+    const controller = new AbortController();
+    chat.mockResolvedValueOnce(readCall("test.txt"));
+    chat.mockImplementationOnce(async () => {
+      controller.abort(new Error("cancelled by local_cancel"));
+      throw new DOMException("aborted", "AbortError");
+    });
+
+    const result = await run({ signal: controller.signal });
+
+    expect(result.steps).toHaveLength(1);
+    expect(result.aborted).toBe("cancelled");
+    expect(result.finalMessage).toBe("");
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(chat.mock.calls[0]![2]).toBe(controller.signal);
+  });
+
+  it("reports cancelled, not parse_failed, when aborted during correction retries", async () => {
+    const controller = new AbortController();
+    chat.mockResolvedValueOnce(reply({ content: '{"name": "read_file", "parameters": {"path": ' }));
+    chat.mockImplementation(async () => {
+      controller.abort(new Error("cancelled by local_cancel"));
+      throw new DOMException("aborted", "AbortError");
+    });
+
+    const result = await run({ signal: controller.signal });
+
+    expect(result.aborted).toBe("cancelled");
+    expect(result.parseFailure).toBeUndefined();
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "does not run the rest of a tool batch after an abort",
+    async () => {
+      const controller = new AbortController();
+      chat.mockResolvedValueOnce(
+        reply({
+          tool_calls: [
+            { function: { name: "bash", arguments: { command: "sleep 5" } } },
+            { function: { name: "write_file", arguments: { path: "late.txt", content: "x" } } },
+          ],
+        }),
+      );
+      setTimeout(() => controller.abort(), 100); // fires while the first tool is still sleeping
+
+      const result = await run({
+        signal: controller.signal,
+        shellMode: "restricted",
+        allowedCommands: ["sleep"],
+      });
+
+      expect(result.aborted).toBe("cancelled");
+      expect(result.steps.map((s) => s.toolName)).toEqual(["bash"]);
+      await expect(fs.access(path.join(tempDir, "late.txt"))).rejects.toThrow();
+    },
+  );
+
+  it("does not call the model when the signal is already aborted", async () => {
+    const result = await run({ signal: AbortSignal.abort() });
+    expect(chat).not.toHaveBeenCalled();
+    expect(result.aborted).toBe("cancelled");
+  });
+
+  it("reports timed_out for a TimeoutError reason", async () => {
+    const signal = AbortSignal.timeout(50);
+    chat.mockImplementationOnce(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      throw new DOMException("t", "TimeoutError");
+    });
+
+    const result = await run({ signal });
+
+    expect(result.aborted).toBe("timed_out");
+  });
+
   it("sends no format on the main call and names the tool on results", async () => {
     chat.mockResolvedValueOnce(readCall("test.txt"));
     chat.mockResolvedValueOnce(reply({ content: "Done." }));
@@ -224,7 +307,7 @@ describe("formatAgentResult", () => {
       mode: "direct",
     };
     expect(formatAgentResult({ ...base, iterationCount: 3 }, 20, run)).toBe(
-      "[worker gpu0 | m | job 3f2a1c9e | 17.8s | 3 iterations | mode direct]\nSummary.",
+      "[worker gpu0 | m | job 3f2a1c9e | 17.8s | 3 iterations | mode direct | status completed]\nSummary.",
     );
     expect(formatAgentResult(base, 20)).toBe("Summary.");
   });
@@ -255,6 +338,30 @@ describe("formatAgentResult", () => {
     );
     expect(text).toContain("parse failed after 3 attempts: bad json");
     expect(text.length).toBeLessThan(700);
+  });
+});
+
+describe("jobStatus", () => {
+  const base = { steps: [], finalMessage: "x", iterationCount: 1, stoppedByLimit: false };
+  it("maps result shapes to statuses", () => {
+    expect(jobStatus(base)).toBe("completed");
+    expect(jobStatus({ ...base, stoppedByLimit: true })).toBe("stopped_at_limit");
+    expect(
+      jobStatus({
+        ...base,
+        parseFailure: { reason: "r", rawContent: "", attemptCount: 3, lastError: "r" },
+      }),
+    ).toBe("parse_failed");
+    expect(jobStatus({ ...base, aborted: "cancelled" })).toBe("cancelled");
+    expect(jobStatus({ ...base, aborted: "timed_out" })).toBe("timed_out");
+  });
+
+  it("shows in the header and as a log line", () => {
+    const run = { workerId: "w", model: "m", jobId: "j", elapsedMs: 1000, mode: "direct" };
+    const text = formatAgentResult({ ...base, finalMessage: "", aborted: "cancelled" }, 20, run);
+    expect(text).toContain("| status cancelled]");
+    expect(text).toContain("[cancelled after 1 iterations");
+    expect(text).not.toContain("empty final message");
   });
 });
 

@@ -83,6 +83,7 @@ All settings are controlled via environment variables. Set them in your MCP conf
 | `AGENT_TIMEOUT_SECONDS` | `120` | Timeout per bash command in seconds |
 | `AGENT_SHELL_MODE` | `restricted` | `restricted` (allow-list), `full` (no restrictions, warning printed), or `none` (bash disabled) |
 | `AGENT_ALLOWED_COMMANDS` | *(empty)* | Comma-separated commands to add to the default allow-list (e.g., `rm,curl`) |
+| `AGENT_JOB_TIMEOUT_SECONDS` | `900` | Wall-clock limit per job once it has a worker; the job returns what it has when it expires |
 | `AGENT_NUM_CTX` | *(Ollama default)* | Context window, sent to Ollama as `options.num_ctx`. Set it for multi-step tasks (e.g., `32768`) — a small context silently drops earlier file reads |
 
 **Default allow-list** (when `AGENT_SHELL_MODE=restricted`): git, ls, cat, echo, grep, head, tail, wc, find, mkdir, cp, mv, touch, npm, node, python.
@@ -164,9 +165,37 @@ The `local_worker_status` tool shows the pool:
 
 `status` is `idle`, `busy`, `probing` (claimed for a job, health check still running), or `unhealthy` (the endpoint did not answer its last probe).
 
+## Tools
+
+| Tool | Inputs | What it does |
+|------|--------|--------------|
+| `local_analyze` | `objective`, `paths[]`, `constraints[]?` | Read-only investigation of the checkout. Returns findings with file:line evidence. |
+| `local_implement` | `objective`, `paths[]`, `acceptance_criteria[]`, `test_commands[]`, `constraints[]?` | Bounded change in an isolated git worktree. Returns report + changed files + unified diff. |
+| `local_review` | `objective`, `paths[]?`, `diff?`, `review_focus[]?` | Read-only review: issues with severity and file:line, fixes, test gaps, confidence. |
+| `run_local_agent` | `prompt`, `mode?` | Free-form task; `mode` picks the execution mode below (default `direct`). |
+| `local_worker_status` | — | Workers, their state, running job ids, queue length. |
+| `local_cancel` | `job_id` | Stops a running job; its call returns with `status cancelled` and the work so far. |
+
+The job tools also accept `worker`, `model`, `max_iterations`, and `timeout_seconds` overrides.
+
+Every result starts with a header:
+
+```
+[worker gpu0 | qwen3.8:27b | job 3f2a1c9e | 41.2s | 7 iterations | mode implement | status completed]
+```
+
+`status` is one of `completed`, `stopped_at_limit` (hit `max_iterations`), `parse_failed` (the model never produced a usable tool call), `cancelled`, or `timed_out`. Anything but `completed` means the report is partial — the steps so far and, for `implement`, the partial diff are still returned so nothing is lost, but nothing is claimed either.
+
+### Cancellation and timeouts
+
+- `local_cancel(job_id)` aborts the in-flight model request and kills any running shell command; the worker is freed at once.
+- Every job has a wall-clock limit: `AGENT_JOB_TIMEOUT_SECONDS` (default 900), or `timeout_seconds` per call. The clock starts when the job gets a worker, so queue time does not count.
+- If the MCP client cancels or disconnects, a running job is aborted and a queued one is dropped.
+- Job ids appear in result headers and in `local_worker_status`; a queued job has no id yet.
+
 ## Execution modes
 
-`run_local_agent` takes an optional `mode`:
+`run_local_agent` takes an optional `mode` (the semantic tools pick theirs: `local_analyze` and `local_review` are `analyze`, `local_implement` is `implement`):
 
 | Mode | Runs in | File tools | Shell | Returns |
 |------|---------|------------|-------|---------|

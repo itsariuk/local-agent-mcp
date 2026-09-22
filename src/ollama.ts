@@ -44,6 +44,7 @@ export interface OllamaChatResponse {
 export async function chatWithOllama(
   host: string,
   request: OllamaChatRequest,
+  signal?: AbortSignal,
 ): Promise<OllamaChatResponse> {
   const url = `${host}/api/chat`;
 
@@ -53,8 +54,11 @@ export async function chatWithOllama(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(request),
+      signal,
     });
   } catch (err) {
+    // An abort is the caller's doing (cancel/timeout) — pass its reason through untouched
+    if (signal?.aborted) throw err;
     const code = (err as { cause?: { code?: string } }).cause?.code;
     if (code === "UND_ERR_HEADERS_TIMEOUT") {
       // ponytail: non-streaming request hit Node fetch's response timeout; switch to stream:true when the provider layer lands

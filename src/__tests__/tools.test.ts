@@ -393,6 +393,39 @@ describe("bash", () => {
     expect(result.output.trim()).toBe("red plain");
   });
 
+  it.skipIf(process.platform === "win32")("is killed when the signal aborts", async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    setTimeout(() => controller.abort(), 100);
+    const result = await executeTool(
+      "bash",
+      { command: "sleep 5" },
+      tempDir,
+      "restricted",
+      [...allowedCommands, "sleep"],
+      10_000,
+      false,
+      controller.signal,
+    );
+    expect(result.success).toBe(false);
+    expect(result.output).toContain("cancelled");
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it("does not spawn when the signal is already aborted", async () => {
+    const result = await executeTool(
+      "bash",
+      { command: "echo hi" },
+      tempDir,
+      "restricted",
+      allowedCommands,
+      timeoutMs,
+      false,
+      AbortSignal.abort(),
+    );
+    expect(result).toEqual({ success: false, output: "command cancelled" });
+  });
+
   it("disabled in none mode", async () => {
     const result = await executeTool(
       "bash",

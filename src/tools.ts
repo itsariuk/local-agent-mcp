@@ -219,9 +219,13 @@ async function bashExec(
   allowedCommands: readonly string[],
   timeoutMs: number,
   readOnly: boolean,
+  signal?: AbortSignal,
 ): Promise<ToolResult> {
   if (shellMode === "none") {
     return { success: false, output: "bash is disabled (shell mode: none)" };
+  }
+  if (signal?.aborted) {
+    return { success: false, output: "command cancelled" };
   }
 
   const command = String(args.command ?? "");
@@ -236,6 +240,7 @@ async function bashExec(
 
   return new Promise<ToolResult>((resolve) => {
     let timedOut = false;
+    let cancelled = false;
     let stdout = "";
     let stderr = "";
 
@@ -261,6 +266,12 @@ async function bashExec(
 
     child.on("close", (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+
+      if (cancelled) {
+        resolve({ success: false, output: "command cancelled" });
+        return;
+      }
 
       if (timedOut) {
         const seconds = Math.round(timeoutMs / 1000);
@@ -280,9 +291,8 @@ async function bashExec(
       resolve({ success: code === 0, output });
     });
 
-    // Timeout: kill process group on Unix, direct kill on Windows
-    const timer = setTimeout(() => {
-      timedOut = true;
+    // Kill the process group on Unix (children included), direct kill on Windows
+    const kill = () => {
       if (isUnix && child.pid) {
         try {
           process.kill(-child.pid, "SIGTERM");
@@ -292,7 +302,18 @@ async function bashExec(
       } else {
         child.kill("SIGTERM");
       }
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      kill();
     }, timeoutMs);
+
+    const onAbort = () => {
+      cancelled = true;
+      kill();
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -308,6 +329,7 @@ export async function executeTool(
   allowedCommands: readonly string[],
   timeoutMs: number,
   readOnly = false,
+  signal?: AbortSignal,
 ): Promise<ToolResult> {
   try {
     if (readOnly && WRITE_TOOLS.has(name)) {
@@ -323,7 +345,15 @@ export async function executeTool(
       case "list_dir":
         return await listDir(args, workingDir);
       case "bash":
-        return await bashExec(args, workingDir, shellMode, allowedCommands, timeoutMs, readOnly);
+        return await bashExec(
+          args,
+          workingDir,
+          shellMode,
+          allowedCommands,
+          timeoutMs,
+          readOnly,
+          signal,
+        );
       default:
         return { success: false, output: `unknown tool: ${name}` };
     }

@@ -2,7 +2,7 @@
  * Configuration module — reads environment variables at startup with
  * documented defaults and fail-fast validation.
  *
- * Covers CONF-01 through CONF-09.
+ * Covers CONF-01 through CONF-10.
  */
 
 import { DEFAULT_ALLOWED_COMMANDS } from "./security.js";
@@ -38,6 +38,7 @@ export interface AppConfig {
   shellMode: ShellMode;
   allowedCommands: readonly string[];
   numCtx?: number;
+  jobTimeoutMs: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +129,9 @@ export function loadConfig(): AppConfig {
   const numCtx =
     process.env.AGENT_NUM_CTX === undefined ? undefined : parsePositiveInt("AGENT_NUM_CTX", 0);
 
+  // CONF-10: whole-job wall clock; the job returns what it has when it expires
+  const jobTimeoutMs = parsePositiveInt("AGENT_JOB_TIMEOUT_SECONDS", 900) * 1000;
+
   return {
     workers,
     model,
@@ -137,5 +141,6 @@ export function loadConfig(): AppConfig {
     shellMode,
     allowedCommands,
     numCtx,
+    jobTimeoutMs,
   };
 }

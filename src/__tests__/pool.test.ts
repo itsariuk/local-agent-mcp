@@ -197,6 +197,47 @@ describe("WorkerPool health", () => {
 // ---------------------------------------------------------------------------
 
 describe("WorkerPool cancellation and status", () => {
+  /** A job that ends only when its signal aborts; records the abort reason. */
+  function abortableJob(pool: WorkerPool, opts: { signal?: AbortSignal } = {}) {
+    const state = { reason: undefined as unknown };
+    const done = pool.run(
+      (w, _jobId, signal) =>
+        new Promise<string>((resolve) => {
+          signal.addEventListener("abort", () => {
+            state.reason = signal.reason;
+            resolve(w.id);
+          });
+        }),
+      opts,
+    );
+    return Object.assign(state, { done });
+  }
+
+  it("cancels a running job by id and frees the worker", async () => {
+    const pool = new WorkerPool([W[0]!], healthy);
+    const job = abortableJob(pool);
+    await tick();
+    const jobId = (await pool.status()).workers[0]!.job_id!;
+
+    expect(pool.cancel("nope")).toBeUndefined();
+    expect(pool.cancel(jobId)).toEqual({ workerId: "gpu0" });
+
+    expect(await job.done).toBe("gpu0");
+    expect((job.reason as Error).message).toContain("cancelled by local_cancel");
+    expect((await pool.status()).workers[0]!.status).toBe("idle");
+  });
+
+  it("aborts a running job when the caller's signal aborts", async () => {
+    const pool = new WorkerPool([W[0]!], healthy);
+    const controller = new AbortController();
+    const job = abortableJob(pool, { signal: controller.signal });
+    await tick();
+
+    controller.abort();
+
+    expect(await job.done).toBe("gpu0");
+  });
+
   it("drops a queued job when its signal aborts", async () => {
     const pool = new WorkerPool([W[0]!], healthy);
     const a = gatedJob(pool);

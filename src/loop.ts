@@ -24,6 +24,21 @@ export interface AgentResult {
   iterationCount: number;
   stoppedByLimit: boolean;
   parseFailure?: ParseFailure; // per D-08
+  aborted?: "cancelled" | "timed_out";
+}
+
+export type JobStatus =
+  | "completed"
+  | "stopped_at_limit"
+  | "parse_failed"
+  | "cancelled"
+  | "timed_out";
+
+export function jobStatus(result: AgentResult): JobStatus {
+  if (result.aborted) return result.aborted;
+  if (result.parseFailure) return "parse_failed";
+  if (result.stoppedByLimit) return "stopped_at_limit";
+  return "completed";
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +89,7 @@ export async function runAgentLoop(options: {
   timeoutMs: number;
   numCtx?: number;
   readOnly?: boolean;
+  signal?: AbortSignal;
 }): Promise<AgentResult> {
   const {
     prompt,
@@ -86,7 +102,16 @@ export async function runAgentLoop(options: {
     timeoutMs,
     numCtx,
     readOnly = false,
+    signal,
   } = options;
+
+  // AbortSignal.timeout sets a TimeoutError reason; local_cancel passes a plain Error
+  const abortedAs = (): AgentResult["aborted"] =>
+    signal?.aborted
+      ? (signal.reason as { name?: string } | undefined)?.name === "TimeoutError"
+        ? "timed_out"
+        : "cancelled"
+      : undefined;
 
   const tools = toolDefinitions(readOnly);
 
@@ -104,29 +129,37 @@ export async function runAgentLoop(options: {
 
   // chatFn for parser retry loop — isolated from main conversation history (per D-03)
   const chatFn = async (correctionMessages: OllamaMessage[]): Promise<OllamaMessage> => {
-    const response = await chatWithOllama(host, {
-      model,
-      messages: correctionMessages,
-      tools,
-      stream: false as const,
-      format: "json",
-      ...ollamaOptions,
-    });
+    const response = await chatWithOllama(
+      host,
+      {
+        model,
+        messages: correctionMessages,
+        tools,
+        stream: false as const,
+        format: "json",
+        ...ollamaOptions,
+      },
+      signal,
+    );
     return response.message;
   };
 
   while (iteration < maxIterations) {
+    if (signal?.aborted) break;
     iteration++;
 
-    const response = await chatWithOllama(host, {
-      model,
-      messages,
-      tools,
-      stream: false as const,
-      ...ollamaOptions,
-    });
-
-    const assistantMessage = response.message;
+    let assistantMessage: OllamaMessage;
+    try {
+      const response = await chatWithOllama(
+        host,
+        { model, messages, tools, stream: false as const, ...ollamaOptions },
+        signal,
+      );
+      assistantMessage = response.message;
+    } catch (err) {
+      if (signal?.aborted) break; // cancelled/timed out mid-request: keep what we have
+      throw err;
+    }
 
     // CRITICAL (LOOP-04): Append assistant message BEFORE processing tool results
     messages.push(assistantMessage);
@@ -144,6 +177,8 @@ export async function runAgentLoop(options: {
         toolCalls = verdict;
       } else if (verdict === "broken") {
         const parseResult = await parseToolCall(content, chatFn);
+        // parseToolCall swallows an aborted chatFn as a retry failure; do not report that as parse_failed
+        if (signal?.aborted) break;
 
         // Check for ParseFailure (per D-07)
         if ("reason" in parseResult) {
@@ -177,6 +212,7 @@ export async function runAgentLoop(options: {
 
     // Process each tool call
     for (const tc of toolCalls) {
+      if (signal?.aborted) break; // the rest of the batch must not run after a cancel
       const name = tc.function.name;
       const args = tc.function.arguments; // Pre-parsed object, do NOT JSON.parse
 
@@ -188,6 +224,7 @@ export async function runAgentLoop(options: {
         allowedCommands,
         timeoutMs,
         readOnly,
+        signal,
       );
 
       steps.push({ toolName: name, args, result });
@@ -199,6 +236,11 @@ export async function runAgentLoop(options: {
         content: clipForModel(result.output),
       });
     }
+  }
+
+  const aborted = abortedAs();
+  if (aborted) {
+    return { steps, finalMessage: "", iterationCount: iteration, stoppedByLimit: false, aborted };
   }
 
   // Check if stopped by iteration limit
@@ -258,18 +300,23 @@ export function formatAgentResult(
     logLines.push(`[stopped: max iterations reached (${maxIterations})]`);
   }
 
+  if (result.aborted) {
+    const what = result.aborted === "timed_out" ? "timed out" : "cancelled";
+    logLines.push(`[${what} after ${result.iterationCount} iterations; work so far is above]`);
+  }
+
   if (result.parseFailure) {
     logLines.push(
       `[parse failed after ${result.parseFailure.attemptCount} attempts: ${result.parseFailure.reason}]`,
       result.parseFailure.rawContent.slice(0, MAX_REPORT_EXCERPT_CHARS),
     );
-  } else if (!result.stoppedByLimit && result.finalMessage.trim() === "") {
+  } else if (!result.stoppedByLimit && !result.aborted && result.finalMessage.trim() === "") {
     logLines.push("[model returned an empty final message]");
   }
 
   const executionLog = logLines.length > 0 ? logLines.join("\n") + "\n\n" : "";
   const header = run
-    ? `[worker ${run.workerId} | ${run.model} | job ${run.jobId} | ${(run.elapsedMs / 1000).toFixed(1)}s | ${result.iterationCount} iterations | mode ${run.mode}]\n`
+    ? `[worker ${run.workerId} | ${run.model} | job ${run.jobId} | ${(run.elapsedMs / 1000).toFixed(1)}s | ${result.iterationCount} iterations | mode ${run.mode} | status ${jobStatus(result)}]\n`
     : "";
   return header + executionLog + result.finalMessage;
 }

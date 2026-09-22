@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { checkHealth } from "../ollama.js";
+import { checkHealth, chatWithOllama } from "../ollama.js";
 
 // ---------------------------------------------------------------------------
 // Mock server helper
@@ -21,6 +21,16 @@ afterEach(async () => {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+describe("chatWithOllama", () => {
+  it("passes an abort through as the signal's reason, not as 'not running'", async () => {
+    const url = await listen(() => {}); // never answers
+    const request = { model: "m", messages: [], stream: false as const };
+    await expect(chatWithOllama(url, request, AbortSignal.timeout(100))).rejects.toMatchObject({
+      name: "TimeoutError",
+    });
+  });
 });
 
 describe("checkHealth", () => {
