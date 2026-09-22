@@ -24,6 +24,9 @@ export interface WorkerSnapshot {
   provider: ProviderKind;
   job_id?: string;
   busy_seconds?: number;
+  jobs: number;
+  busy_seconds_total: number;
+  tokens: { prompt: number; completion: number };
 }
 
 export interface PoolStatus {
@@ -41,6 +44,9 @@ interface WorkerState extends WorkerConfig {
   jobId?: string;
   busySince?: number;
   controller?: AbortController;
+  jobs: number;
+  busyMsTotal: number;
+  tokens: { prompt: number; completion: number };
 }
 
 export type Job<T> = (worker: WorkerConfig, jobId: string, signal: AbortSignal) => Promise<T>;
@@ -62,7 +68,13 @@ export class WorkerPool {
     configs: readonly WorkerConfig[],
     private readonly healthFn: HealthFn = defaultHealth,
   ) {
-    this.workers = configs.map((c) => ({ ...c, status: "idle" as const }));
+    this.workers = configs.map((c) => ({
+      ...c,
+      status: "idle" as const,
+      jobs: 0,
+      busyMsTotal: 0,
+      tokens: { prompt: 0, completion: 0 },
+    }));
   }
 
   /**
@@ -109,6 +121,14 @@ export class WorkerPool {
     return { workerId: worker.id };
   }
 
+  /** Add a finished job's token usage to its worker's running total. */
+  recordUsage(workerId: string, usage: { promptTokens: number; completionTokens: number }): void {
+    const worker = this.workers.find((w) => w.id === workerId);
+    if (!worker) return;
+    worker.tokens.prompt += usage.promptTokens;
+    worker.tokens.completion += usage.completionTokens;
+  }
+
   /** Snapshot for the supervisor. Probes every worker that is not busy. */
   async status(): Promise<PoolStatus> {
     await Promise.all(
@@ -131,6 +151,9 @@ export class WorkerPool {
         ...(w.busySince !== undefined && {
           busy_seconds: Math.round((Date.now() - w.busySince) / 1000),
         }),
+        jobs: w.jobs,
+        busy_seconds_total: Math.round(w.busyMsTotal / 1000),
+        tokens: { ...w.tokens },
       })),
       queued: this.queue.length,
     };
@@ -158,6 +181,7 @@ export class WorkerPool {
   ): Promise<T> {
     worker.jobId = randomUUID().slice(0, 8);
     worker.busySince = Date.now();
+    worker.jobs++;
     worker.controller = new AbortController();
     // local_cancel and a client disconnect both abort the running job
     const signal = clientSignal
@@ -170,6 +194,7 @@ export class WorkerPool {
         signal,
       );
     } finally {
+      worker.busyMsTotal += Date.now() - (worker.busySince ?? Date.now());
       // Most job errors are not outages, and the next dispatch probes anyway
       this.release(worker, "idle");
     }

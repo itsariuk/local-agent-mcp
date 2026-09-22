@@ -276,10 +276,26 @@ describe("WorkerPool cancellation and status", () => {
       status: "probing",
       model: "m",
       provider: "ollama",
+      jobs: 0, // counted once the probe passes and the job starts
+      busy_seconds_total: 0,
+      tokens: { prompt: 0, completion: 0 },
     });
 
     answer(true);
     expect(await run).toBe("gpu0");
+  });
+
+  it("keeps per-worker job counts, busy time and token totals", async () => {
+    const pool = new WorkerPool([W[0]!], healthy);
+    await pool.run(async () => 1);
+    await pool.run(async () => 2);
+    pool.recordUsage("gpu0", { promptTokens: 10, completionTokens: 5 });
+    pool.recordUsage("gpu0", { promptTokens: 10, completionTokens: 5 });
+    pool.recordUsage("nope", { promptTokens: 99, completionTokens: 99 });
+
+    const [w] = (await pool.status()).workers;
+    expect(w).toMatchObject({ jobs: 2, tokens: { prompt: 20, completion: 10 } });
+    expect(w!.busy_seconds_total).toBeGreaterThanOrEqual(0);
   });
 
   it("reports the running job on a busy worker and nothing on an idle one", async () => {
@@ -294,7 +310,15 @@ describe("WorkerPool cancellation and status", () => {
     expect(busy).toMatchObject({ status: "busy", model: "m" });
     expect(busy.job_id).toMatch(/^[0-9a-f]{8}$/);
     expect(busy.busy_seconds).toBeTypeOf("number");
-    expect(idle).toEqual({ id: idle.id, status: "idle", model: "m", provider: "ollama" });
+    expect(idle).toEqual({
+      id: idle.id,
+      status: "idle",
+      model: "m",
+      provider: "ollama",
+      jobs: 0,
+      busy_seconds_total: 0,
+      tokens: { prompt: 0, completion: 0 },
+    });
 
     a.open();
     await a.done;

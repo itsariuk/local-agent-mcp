@@ -2,9 +2,11 @@
  * Configuration module — reads environment variables at startup with
  * documented defaults and fail-fast validation.
  *
- * Covers CONF-01 through CONF-11.
+ * Covers CONF-01 through CONF-12.
  */
 
+import os from "node:os";
+import path from "node:path";
 import { DEFAULT_ALLOWED_COMMANDS } from "./security.js";
 import type { ShellMode } from "./security.js";
 
@@ -43,6 +45,7 @@ export interface AppConfig {
   numCtx?: number;
   jobTimeoutMs: number;
   apiKey?: string;
+  jobLogDir: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +149,16 @@ export function loadConfig(): AppConfig {
   // CONF-11: bearer token for OpenAI-compatible servers that want one
   const apiKey = process.env.AGENT_API_KEY || undefined;
 
+  // CONF-12: per-job records; outside the repo so they never land in a checkout or a worktree snapshot
+  // `||`: an empty value means unset (XDG says so), and must never resolve to the cwd
+  const jobLogDir =
+    process.env.AGENT_JOB_LOG_DIR ||
+    path.join(
+      process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"),
+      "local-agent-mcp",
+      "jobs",
+    );
+
   return {
     workers,
     model,
@@ -157,5 +170,6 @@ export function loadConfig(): AppConfig {
     numCtx,
     jobTimeoutMs,
     apiKey,
+    jobLogDir,
   };
 }

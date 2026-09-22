@@ -5,7 +5,7 @@ import os from "node:os";
 import type { OllamaMessage } from "../ollama.js";
 import type { ChatRequest, ChatResponse, InferenceProvider } from "../provider.js";
 import { toOpenAIMessages } from "../provider.js";
-import { runAgentLoop, formatAgentResult, formatDiff, jobStatus } from "../loop.js";
+import { runAgentLoop, formatAgentResult, formatDiff, jobStatus, LoopError } from "../loop.js";
 import type { AgentResult } from "../loop.js";
 
 // A fake provider: the loop must not care what is behind it
@@ -268,6 +268,38 @@ describe("runAgentLoop", () => {
     expect(wireTool.tool_call_id).toBe("call_0");
   });
 
+  it("sums token usage across calls and returns the transcript", async () => {
+    chat.mockResolvedValueOnce({ ...readCall("test.txt"), usage: { promptTokens: 10, completionTokens: 5 } });
+    chat.mockResolvedValueOnce({ ...reply({ content: "Done." }), usage: { promptTokens: 20, completionTokens: 7 } });
+
+    const result = await run();
+
+    expect(result.usage).toEqual({ promptTokens: 30, completionTokens: 12 });
+    expect(result.messages.map((m) => m.role)).toEqual(["system", "user", "assistant", "tool", "assistant"]);
+  });
+
+  it("leaves usage undefined when the backend reports none", async () => {
+    chat.mockResolvedValueOnce(reply({ content: "Done." }));
+    const result = await run();
+    expect(result.usage).toBeUndefined();
+    expect(formatAgentResult(result, 5)).not.toContain("tok");
+  });
+
+  it("keeps the partial transcript on the error when the backend fails mid-job", async () => {
+    chat.mockResolvedValueOnce({ ...readCall("test.txt"), usage: { promptTokens: 5, completionTokens: 1 } });
+    chat.mockRejectedValueOnce(new Error("Ollama error: 500 Internal Server Error"));
+
+    const err = await run().catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(LoopError);
+    const { partial } = err as LoopError;
+    expect((err as Error).message).toContain("500");
+    expect(partial.steps).toHaveLength(1);
+    expect(partial.iterationCount).toBe(2);
+    expect(partial.usage).toEqual({ promptTokens: 5, completionTokens: 1 });
+    expect(partial.messages.map((m) => m.role)).toEqual(["system", "user", "assistant", "tool"]);
+  });
+
   it("echoes the call id on the tool result when the backend gave one", async () => {
     chat.mockResolvedValueOnce(
       reply({
@@ -318,6 +350,7 @@ describe("formatAgentResult", () => {
     finalMessage: "Summary.",
     iterationCount: 1,
     stoppedByLimit: false,
+    messages: [],
   };
 
   it("clips failure output to its tail", () => {
@@ -381,7 +414,13 @@ describe("formatAgentResult", () => {
 });
 
 describe("jobStatus", () => {
-  const base = { steps: [], finalMessage: "x", iterationCount: 1, stoppedByLimit: false };
+  const base = {
+    steps: [],
+    finalMessage: "x",
+    iterationCount: 1,
+    stoppedByLimit: false,
+    messages: [],
+  };
   it("maps result shapes to statuses", () => {
     expect(jobStatus(base)).toBe("completed");
     expect(jobStatus({ ...base, stoppedByLimit: true })).toBe("stopped_at_limit");
@@ -395,12 +434,25 @@ describe("jobStatus", () => {
     expect(jobStatus({ ...base, aborted: "timed_out" })).toBe("timed_out");
   });
 
-  it("shows in the header and as a log line", () => {
+  it("shows in the header and as a log line, with a log hint when not completed", () => {
     const run = { workerId: "w", model: "m", jobId: "j", elapsedMs: 1000, mode: "direct" };
     const text = formatAgentResult({ ...base, finalMessage: "", aborted: "cancelled" }, 20, run);
     expect(text).toContain("| status cancelled]");
     expect(text).toContain("[cancelled after 1 iterations");
+    expect(text).toContain('[full log: local_job_log("j")]');
     expect(text).not.toContain("empty final message");
+    expect(formatAgentResult(base, 20, run)).not.toContain("local_job_log");
+  });
+
+  it("puts token usage in the header", () => {
+    const run = { workerId: "w", model: "m", jobId: "j", elapsedMs: 1000, mode: "direct" };
+    const usage = { promptTokens: 18_400, completionTokens: 1_200 };
+    expect(formatAgentResult({ ...base, usage }, 20, run)).toContain(
+      "| 1 iterations | 18.4k→1.2k tok | mode direct |",
+    );
+    expect(formatAgentResult({ ...base, usage: { promptTokens: 30, completionTokens: 12 } }, 20, run)).toContain(
+      "| 30→12 tok |",
+    );
   });
 });
 

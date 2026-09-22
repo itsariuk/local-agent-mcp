@@ -10,6 +10,9 @@ import type { AppConfig } from "./config.js";
 import { WorkerPool } from "./pool.js";
 import { analyzePrompt, implementPrompt, reviewPrompt } from "./prompts.js";
 import { createProvider } from "./provider.js";
+import { Metrics, writeJobRecord, readJobRecord, summarizeResult, toUsageRecord } from "./jobs.js";
+import type { JobResultRecord } from "./jobs.js";
+import { jobStatus, LoopError } from "./loop.js";
 
 // ---------------------------------------------------------------------------
 // Configuration (fail-fast on invalid env vars)
@@ -31,11 +34,13 @@ try {
 // ---------------------------------------------------------------------------
 
 const pool = new WorkerPool(config.workers, (w) => createProvider(w, config.apiKey).health());
+const metrics = new Metrics();
 const workerIds = config.workers.map((w) => w.id).join(", ");
 
 type Mode = "analyze" | "implement" | "direct";
 
 interface JobArgs {
+  tool: string;
   prompt: string;
   mode: Mode;
   worker?: string;
@@ -47,53 +52,137 @@ interface JobArgs {
 async function runJob(args: JobArgs, clientSignal: AbortSignal): Promise<string> {
   const { prompt, mode } = args;
   const maxIterations = args.max_iterations ?? config.maxIterations;
-  const timeoutMs = (args.timeout_seconds ?? config.jobTimeoutMs / 1000) * 1000;
+  const timeoutSeconds = args.timeout_seconds ?? config.jobTimeoutMs / 1000;
   const started = Date.now();
 
-  return pool.run(
-    async (w, jobId, jobSignal) => {
-      const model = args.model ?? w.model;
-      const provider = createProvider(w, config.apiKey);
-      const wt = mode === "implement" ? await createWorktree(config.workingDir, jobId) : undefined;
-      // The clock starts once the job has a worker, so queue time does not count
-      const signal = AbortSignal.any([jobSignal, AbortSignal.timeout(timeoutMs)]);
-      let result: AgentResult;
-      let diff: { patch: string; files: string[] } | undefined;
-      try {
-        result = await runAgentLoop({
-          prompt,
+  // Record writes start inside the job but are awaited only after the worker is
+  // released: the disk never holds a GPU, and the client never gets a response
+  // before its record exists (a client that exits right away would lose it).
+  const pendingWrites: Promise<void>[] = [];
+
+  try {
+    return await pool.run(
+      async (w, jobId, jobSignal) => {
+        const model = args.model ?? w.model;
+        const provider = createProvider(w, config.apiKey);
+        metrics.started();
+        // Written before the loop so a crash still leaves the request behind
+        pendingWrites.push(
+          writeJobRecord(config.jobLogDir, jobId, {
+            request: {
+              job_id: jobId,
+              tool: args.tool,
+              mode,
+              prompt,
+              worker: w.id,
+              provider: w.provider,
+              model,
+              max_iterations: maxIterations,
+              timeout_seconds: timeoutSeconds,
+              started_at: new Date(started).toISOString(),
+            },
+          }),
+        );
+
+        const finish = (record: Omit<JobResultRecord, "job_id" | "elapsed_ms" | "finished_at">) => {
+          const full: JobResultRecord = {
+            job_id: jobId,
+            ...record,
+            elapsed_ms: Date.now() - started,
+            finished_at: new Date().toISOString(),
+          };
+          metrics.finished(full);
+          return full;
+        };
+        const nothing = {
+          tool_calls: 0,
+          files_read: [],
+          files_changed: [],
+          commands_run: [],
+          chars_consumed: 0,
+        };
+
+        let wt: Awaited<ReturnType<typeof createWorktree>> | undefined;
+        let result: AgentResult | undefined;
+        let diff: { patch: string; files: string[] } | undefined;
+        try {
+          wt = mode === "implement" ? await createWorktree(config.workingDir, jobId) : undefined;
+          // The clock starts once the job has a worker, so queue time does not count
+          const signal = AbortSignal.any([jobSignal, AbortSignal.timeout(timeoutSeconds * 1000)]);
+          result = await runAgentLoop({
+            prompt,
+            model,
+            provider,
+            workingDir: wt ? path.join(wt.path, wt.relativeDir) : config.workingDir,
+            maxIterations,
+            shellMode: config.shellMode,
+            allowedCommands: config.allowedCommands,
+            timeoutMs: config.timeoutMs,
+            numCtx: config.numCtx,
+            readOnly: mode === "analyze",
+            signal,
+          });
+          if (wt) diff = await captureDiff(wt.path);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          // A backend failure mid-job still leaves a transcript worth keeping
+          const partial = err instanceof LoopError ? err.partial : result;
+          const record = finish({
+            status: message.startsWith("blocked:") ? "blocked" : "failed",
+            iterations: partial?.iterationCount ?? 0,
+            ...(partial ? summarizeResult(partial) : nothing),
+            usage: toUsageRecord(partial?.usage),
+            chars_returned: 0,
+            error: message,
+            ...(wt && { worktree: wt.path }),
+          });
+          pendingWrites.push(
+            writeJobRecord(config.jobLogDir, jobId, {
+              result: record,
+              transcript: partial?.messages,
+            }),
+          );
+          // Keep the worktree for inspection and say where it is
+          throw wt ? new Error(`${message} (worktree kept at ${wt.path})`, { cause: err }) : err;
+        }
+
+        let text = formatAgentResult(result, maxIterations, {
+          workerId: w.id,
           model,
-          provider,
-          workingDir: wt ? path.join(wt.path, wt.relativeDir) : config.workingDir,
-          maxIterations,
-          shellMode: config.shellMode,
-          allowedCommands: config.allowedCommands,
-          timeoutMs: config.timeoutMs,
-          numCtx: config.numCtx,
-          readOnly: mode === "analyze",
-          signal,
+          jobId,
+          elapsedMs: Date.now() - started,
+          mode,
         });
-        if (wt) diff = await captureDiff(wt.path);
-      } catch (err) {
-        // Keep the worktree for inspection and say where it is
-        const message = err instanceof Error ? err.message : String(err);
-        throw wt ? new Error(`${message} (worktree kept at ${wt.path})`, { cause: err }) : err;
-      }
-      let text = formatAgentResult(result, maxIterations, {
-        workerId: w.id,
-        model,
-        jobId,
-        elapsedMs: Date.now() - started,
-        mode,
-      });
-      if (wt && diff) {
-        text += formatDiff(diff.patch, diff.files);
-        await removeWorktree(wt.root, wt.path);
-      }
-      return text;
-    },
-    { workerId: args.worker, signal: clientSignal },
-  );
+        if (wt && diff) {
+          text += formatDiff(diff.patch, diff.files);
+          await removeWorktree(wt.root, wt.path);
+        }
+
+        const summary = summarizeResult(result);
+        const record = finish({
+          status: jobStatus(result),
+          iterations: result.iterationCount,
+          ...summary,
+          // In a worktree the diff is the authoritative list; "M\tpath" → "path"
+          ...(diff && { files_changed: diff.files.map((f) => f.split("\t").pop()!) }),
+          usage: toUsageRecord(result.usage),
+          chars_returned: text.length,
+        });
+        if (result.usage) pool.recordUsage(w.id, result.usage);
+        pendingWrites.push(
+          writeJobRecord(config.jobLogDir, jobId, {
+            result: record,
+            transcript: result.messages,
+            patch: diff?.patch,
+          }),
+        );
+        return text;
+      },
+      { workerId: args.worker, signal: clientSignal },
+    );
+  } finally {
+    await Promise.all(pendingWrites);
+  }
 }
 
 const toolResult = (text: string) => ({ content: [{ type: "text" as const, text }] });
@@ -153,7 +242,10 @@ server.registerTool(
   async (args, extra) => {
     try {
       return toolResult(
-        await runJob({ ...args, prompt: analyzePrompt(args), mode: "analyze" }, extra.signal),
+        await runJob(
+          { ...args, tool: "local_analyze", prompt: analyzePrompt(args), mode: "analyze" },
+          extra.signal,
+        ),
       );
     } catch (err) {
       return toolError(err);
@@ -185,7 +277,10 @@ server.registerTool(
   async (args, extra) => {
     try {
       return toolResult(
-        await runJob({ ...args, prompt: implementPrompt(args), mode: "implement" }, extra.signal),
+        await runJob(
+          { ...args, tool: "local_implement", prompt: implementPrompt(args), mode: "implement" },
+          extra.signal,
+        ),
       );
     } catch (err) {
       return toolError(err);
@@ -214,7 +309,10 @@ server.registerTool(
     }
     try {
       return toolResult(
-        await runJob({ ...args, prompt: reviewPrompt(args), mode: "analyze" }, extra.signal),
+        await runJob(
+          { ...args, tool: "local_review", prompt: reviewPrompt(args), mode: "analyze" },
+          extra.signal,
+        ),
       );
     } catch (err) {
       return toolError(err);
@@ -239,7 +337,7 @@ server.registerTool(
   },
   async ({ mode = "direct", ...args }, extra) => {
     try {
-      return toolResult(await runJob({ ...args, mode }, extra.signal));
+      return toolResult(await runJob({ ...args, tool: "run_local_agent", mode }, extra.signal));
     } catch (err) {
       return toolError(err);
     }
@@ -267,17 +365,42 @@ server.registerTool(
   "local_worker_status",
   {
     description:
-      "Show each local worker's state (idle, busy, probing, unhealthy), its model, the running job id, and how many jobs are queued. Workers that are not busy are probed live.",
+      "Show each local worker's state (idle, busy, probing, unhealthy), provider, model, running job id, and totals (jobs, busy seconds, tokens); how many jobs are queued; and server-lifetime metrics including supervisor_context_saved_chars. Workers that are not busy are probed live.",
     inputSchema: {},
   },
-  async () => toolResult(JSON.stringify(await pool.status(), null, 2)),
+  async () =>
+    toolResult(JSON.stringify({ ...(await pool.status()), metrics: metrics.snapshot() }, null, 2)),
+);
+
+server.registerTool(
+  "local_job_log",
+  {
+    description:
+      "Read a finished job's stored record: request, result summary (status, tokens, files, commands) and the last N transcript entries with unclipped tool output. Use it when a result header shows a status other than completed.",
+    inputSchema: {
+      job_id: z.string().regex(/^[0-9a-f]{8}$/, "job ids are 8 hex characters"),
+      tail: z
+        .number()
+        .int()
+        .positive()
+        .max(200)
+        .optional()
+        .describe("Transcript entries to return from the end (default 20)"),
+    },
+  },
+  async ({ job_id, tail }) => {
+    const record = await readJobRecord(config.jobLogDir, job_id, tail ?? 20);
+    return record
+      ? toolResult(JSON.stringify(record, null, 2))
+      : toolError(new Error(`no record for job ${job_id} under ${config.jobLogDir}`));
+  },
 );
 
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    `local-agent-mcp | dir: ${config.workingDir} | model: ${config.model} | shell: ${config.shellMode} | workers: ${config.workers.map((w) => `${w.id}=${w.host} (${w.provider})`).join(", ")} | ctx: ${config.numCtx ?? "default"} | job timeout: ${config.jobTimeoutMs / 1000}s`,
+    `local-agent-mcp | dir: ${config.workingDir} | model: ${config.model} | shell: ${config.shellMode} | workers: ${config.workers.map((w) => `${w.id}=${w.host} (${w.provider})`).join(", ")} | ctx: ${config.numCtx ?? "default"} | job timeout: ${config.jobTimeoutMs / 1000}s | jobs: ${config.jobLogDir}`,
   );
   if (config.numCtx !== undefined && config.workers.some((w) => w.provider === "openai")) {
     console.error(

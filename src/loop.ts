@@ -25,6 +25,24 @@ export interface AgentResult {
   stoppedByLimit: boolean;
   parseFailure?: ParseFailure; // per D-08
   aborted?: "cancelled" | "timed_out";
+  usage?: TokenUsage; // summed over every model call, when the backend reports it
+  messages: OllamaMessage[]; // the full transcript, unclipped tool output included
+}
+
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+}
+
+/** Thrown when the backend fails mid-job; carries what the loop had done so far so it can be recorded. */
+export class LoopError extends Error {
+  constructor(
+    cause: unknown,
+    readonly partial: AgentResult,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "LoopError";
+  }
 }
 
 export type JobStatus =
@@ -125,12 +143,21 @@ export async function runAgentLoop(options: {
   let finalMessage = "";
   let stoppedByLimit = false;
 
+  let usage: TokenUsage | undefined;
+  const addUsage = (u?: TokenUsage) => {
+    if (!u) return;
+    usage = usage ?? { promptTokens: 0, completionTokens: 0 };
+    usage.promptTokens += u.promptTokens;
+    usage.completionTokens += u.completionTokens;
+  };
+
   // chatFn for parser retry loop — isolated from main conversation history (per D-03)
   const chatFn = async (correctionMessages: OllamaMessage[]): Promise<OllamaMessage> => {
     const response = await provider.chat(
       { model, messages: correctionMessages, tools, jsonOnly: true, numCtx },
       signal,
     );
+    addUsage(response.usage); // correction turns are real GPU work too
     return response.message;
   };
 
@@ -141,10 +168,18 @@ export async function runAgentLoop(options: {
     let assistantMessage: OllamaMessage;
     try {
       const response = await provider.chat({ model, messages, tools, numCtx }, signal);
+      addUsage(response.usage);
       assistantMessage = response.message;
     } catch (err) {
       if (signal?.aborted) break; // cancelled/timed out mid-request: keep what we have
-      throw err;
+      throw new LoopError(err, {
+        steps,
+        finalMessage: "",
+        iterationCount: iteration,
+        stoppedByLimit: false,
+        usage,
+        messages,
+      });
     }
 
     // CRITICAL (LOOP-04): Append assistant message BEFORE processing tool results
@@ -180,6 +215,8 @@ export async function runAgentLoop(options: {
             iterationCount: iteration,
             stoppedByLimit: false,
             parseFailure: parseResult,
+            usage,
+            messages,
           };
         }
 
@@ -232,7 +269,15 @@ export async function runAgentLoop(options: {
 
   const aborted = abortedAs();
   if (aborted) {
-    return { steps, finalMessage: "", iterationCount: iteration, stoppedByLimit: false, aborted };
+    return {
+      steps,
+      finalMessage: "",
+      iterationCount: iteration,
+      stoppedByLimit: false,
+      aborted,
+      usage,
+      messages,
+    };
   }
 
   // Check if stopped by iteration limit
@@ -245,7 +290,17 @@ export async function runAgentLoop(options: {
     }
   }
 
-  return { steps, finalMessage, iterationCount: iteration, stoppedByLimit };
+  return { steps, finalMessage, iterationCount: iteration, stoppedByLimit, usage, messages };
+}
+
+// ---------------------------------------------------------------------------
+// Header helpers
+// ---------------------------------------------------------------------------
+
+const fmtCount = (n: number) => (n < 1000 ? String(n) : `${(n / 1000).toFixed(1)}k`);
+
+export function formatTokens(usage: TokenUsage): string {
+  return `${fmtCount(usage.promptTokens)}→${fmtCount(usage.completionTokens)} tok`;
 }
 
 // ---------------------------------------------------------------------------
@@ -306,9 +361,14 @@ export function formatAgentResult(
     logLines.push("[model returned an empty final message]");
   }
 
+  const status = jobStatus(result);
+  if (run && status !== "completed") {
+    logLines.push(`[full log: local_job_log("${run.jobId}")]`);
+  }
   const executionLog = logLines.length > 0 ? logLines.join("\n") + "\n\n" : "";
+  const tokens = result.usage ? ` | ${formatTokens(result.usage)}` : "";
   const header = run
-    ? `[worker ${run.workerId} | ${run.model} | job ${run.jobId} | ${(run.elapsedMs / 1000).toFixed(1)}s | ${result.iterationCount} iterations | mode ${run.mode} | status ${jobStatus(result)}]\n`
+    ? `[worker ${run.workerId} | ${run.model} | job ${run.jobId} | ${(run.elapsedMs / 1000).toFixed(1)}s | ${result.iterationCount} iterations${tokens} | mode ${run.mode} | status ${status}]\n`
     : "";
   return header + executionLog + result.finalMessage;
 }

@@ -1,4 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
+import os from "node:os";
+import path from "node:path";
 import { loadConfig, ConfigError } from "../config.js";
 import { DEFAULT_ALLOWED_COMMANDS } from "../security.js";
 
@@ -18,6 +20,8 @@ const ENV_KEYS = [
   "AGENT_WORKERS",
   "AGENT_JOB_TIMEOUT_SECONDS",
   "AGENT_API_KEY",
+  "AGENT_JOB_LOG_DIR",
+  "XDG_STATE_HOME",
 ] as const;
 
 function snapshotEnv(): Record<string, string | undefined> {
@@ -147,6 +151,23 @@ describe("loadConfig", () => {
   it("OLLAMA_HOST pointing at /v1 gives a single OpenAI-compatible worker", () => {
     setup({ OLLAMA_HOST: "http://a:11434/v1" });
     expect(loadConfig().workers[0]!.provider).toBe("openai");
+  });
+
+  it("job records default to the XDG state dir and honour overrides", () => {
+    setup();
+    const dflt = loadConfig().jobLogDir;
+    expect(dflt.startsWith(os.homedir())).toBe(true);
+    expect(dflt.endsWith(path.join("local-agent-mcp", "jobs"))).toBe(true);
+
+    setup({ XDG_STATE_HOME: "/x" });
+    expect(loadConfig().jobLogDir).toBe(path.join("/x", "local-agent-mcp", "jobs"));
+
+    setup({ AGENT_JOB_LOG_DIR: "/y" });
+    expect(loadConfig().jobLogDir).toBe("/y");
+
+    // Empty means unset, never the current directory
+    setup({ AGENT_JOB_LOG_DIR: "", XDG_STATE_HOME: "" });
+    expect(loadConfig().jobLogDir).toBe(dflt);
   });
 
   it("AGENT_API_KEY sets apiKey", () => {

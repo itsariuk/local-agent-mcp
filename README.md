@@ -86,6 +86,7 @@ All settings are controlled via environment variables. Set them in your MCP conf
 | `AGENT_JOB_TIMEOUT_SECONDS` | `900` | Wall-clock limit per job once it has a worker; the job returns what it has when it expires |
 | `AGENT_NUM_CTX` | *(Ollama default)* | Context window, sent to Ollama as `options.num_ctx`. Set it for multi-step tasks (e.g., `32768`) — a small context silently drops earlier file reads. Ollama workers only; OpenAI-compatible servers set their context size themselves |
 | `AGENT_API_KEY` | *(unset)* | Sent as `Authorization: Bearer …` to OpenAI-compatible servers that require one |
+| `AGENT_JOB_LOG_DIR` | `$XDG_STATE_HOME/local-agent-mcp/jobs` (`~/.local/state/…`) | Where per-job records are written (see [Job records and metrics](#job-records-and-metrics)) |
 
 **Default allow-list** (when `AGENT_SHELL_MODE=restricted`): git, ls, cat, echo, grep, head, tail, wc, find, mkdir, cp, mv, touch, npm, node, python.
 
@@ -195,6 +196,7 @@ The `local_worker_status` tool shows the pool:
 | `run_local_agent` | `prompt`, `mode?` | Free-form task; `mode` picks the execution mode below (default `direct`). |
 | `local_worker_status` | — | Workers, their state, running job ids, queue length. |
 | `local_cancel` | `job_id` | Stops a running job; its call returns with `status cancelled` and the work so far. |
+| `local_job_log` | `job_id`, `tail?` | Reads a finished job's stored record: request, result summary, and the last N transcript entries with unclipped tool output. |
 
 The job tools also accept `worker`, `model`, `max_iterations`, and `timeout_seconds` overrides.
 
@@ -212,6 +214,37 @@ Every result starts with a header:
 - Every job has a wall-clock limit: `AGENT_JOB_TIMEOUT_SECONDS` (default 900), or `timeout_seconds` per call. The clock starts when the job gets a worker, so queue time does not count.
 - If the MCP client cancels or disconnects, a running job is aborted and a queued one is dropped.
 - Job ids appear in result headers and in `local_worker_status`; a queued job has no id yet.
+
+## Job records and metrics
+
+Every job leaves a directory under `AGENT_JOB_LOG_DIR` (default `~/.local/state/local-agent-mcp/jobs`, never inside your repository):
+
+```
+jobs/3f2a1c9e/
+  request.json     tool, mode, prompt, worker, provider, model, limits, started_at
+  result.json      status, iterations, elapsed_ms, usage, tool_calls, files_read, files_changed,
+                   commands_run (with pass/fail), chars_consumed, chars_returned, error?, worktree?
+  transcript.jsonl one line per chat message — the full, unclipped tool output lives only here
+  patch.diff       implement mode only
+```
+
+Writes are best effort and asynchronous: an unwritable directory is logged (`[jobs] failed to write …`) and never fails or slows a job. Transcripts are not redacted; they contain whatever files the worker read.
+
+Result headers show token usage when the backend reports it: `| 18.4k→1.2k tok |` is prompt→completion. Any status other than `completed` ends the result with `[full log: local_job_log("<id>")]`.
+
+`local_worker_status` adds per-worker totals (`jobs`, `busy_seconds_total`, `tokens`) and a `metrics` block for the server's lifetime:
+
+| Field | Meaning |
+|-------|---------|
+| `jobs` | counts by outcome: `started`, `completed`, `stopped_at_limit`, `parse_failed`, `cancelled`, `timed_out`, `failed`, `blocked` |
+| `tokens` | prompt / completion tokens across all jobs (local, i.e. free) |
+| `tool_calls` | tool invocations across all jobs |
+| `chars_consumed` | tool output plus model text the workers processed |
+| `chars_returned` | what the supervisor actually received |
+| `supervisor_context_saved_chars` | `chars_consumed − chars_returned` — a **lower bound, in characters**, on frontier-model context the local workers absorbed. It is not tokens and not money; divide by ~4 for a rough token estimate |
+| `since` | when these counters started (server start) |
+
+**Benchmarking supervisors.** To compare Claude Code and Codex as the supervisor, run the same task list through each with this server attached, then compare the paid-model token usage each client reports against `metrics.tokens` and `supervisor_context_saved_chars` here. The per-job `result.json` files are the raw data if you want a finer breakdown.
 
 ## Execution modes
 

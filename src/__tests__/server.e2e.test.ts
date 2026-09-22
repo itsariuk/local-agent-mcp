@@ -74,6 +74,13 @@ async function startMockOllama(shape: Shape = "ollama"): Promise<MockOllama> {
       const wantsWrite =
         messages[1]!.content.includes("write:") && !messages.some((m) => m.role === "tool");
       const wantsLoop = messages[1]!.content.includes("loop:");
+      // "fail:" — first turn is a tool call, the second turn is a 500
+      if (messages[1]!.content.includes("fail:") && messages.some((m) => m.role === "tool")) {
+        inFlight--;
+        res.statusCode = 500;
+        res.end("boom");
+        return;
+      }
       const call = wantsLoop ? LOOP_CALL : wantsWrite ? WRITE_CALL : undefined;
       // A cancelled job aborts its fetch: the request is gone, so it is no longer in flight
       let settled = false;
@@ -114,7 +121,7 @@ async function startMockOllama(shape: Shape = "ollama"): Promise<MockOllama> {
                   ],
                   usage: { prompt_tokens: 1, completion_tokens: 1 },
                 }
-              : { message, done: true },
+              : { message, done: true, prompt_eval_count: 1, eval_count: 1 },
           ),
         );
       }, CHAT_DELAY_MS);
@@ -162,11 +169,13 @@ const callTool = (name: string, args: object = {}) =>
 let gpu0: MockOllama;
 let gpu1: MockOllama;
 let tempDir: string;
+let jobsDir: string;
 
 beforeAll(async () => {
   // gpu0 speaks Ollama's native API, gpu1 the OpenAI-compatible one
   [gpu0, gpu1] = await Promise.all([startMockOllama("ollama"), startMockOllama("openai")]);
   tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "e2e-test-"));
+  jobsDir = await fs.mkdtemp(path.join(os.tmpdir(), "e2e-jobs-")); // outside the git repo
   await git(tempDir, "init", "-q");
   await fs.writeFile(path.join(tempDir, "a.txt"), "a\n");
   await git(tempDir, "add", "-A");
@@ -179,6 +188,7 @@ beforeAll(async () => {
       AGENT_WORKERS: `gpu0=${gpu0.url},gpu1=${gpu1.url}`,
       AGENT_MODEL: "m",
       AGENT_WORKING_DIR: tempDir,
+      AGENT_JOB_LOG_DIR: jobsDir,
     },
   });
   // Drain stderr: an unread pipe fills after ~64 KB of [agent]/[pool] logs and blocks the server
@@ -214,19 +224,27 @@ afterAll(async () => {
   child.kill();
   await Promise.all([stopMock(gpu0), stopMock(gpu1)]);
   await fs.rm(tempDir, { recursive: true, force: true });
+  await fs.rm(jobsDir, { recursive: true, force: true });
 });
+
+/** The record must be on disk by the time the tool call returns. */
+async function readResult(jobId: string): Promise<Record<string, unknown>> {
+  const file = path.join(jobsDir, jobId, "result.json");
+  return JSON.parse(await fs.readFile(file, "utf-8")) as Record<string, unknown>;
+}
 
 // ---------------------------------------------------------------------------
 // Tests (order matters: the last one takes gpu1 down)
 // ---------------------------------------------------------------------------
 
 describe("MCP server with two workers", { timeout: 20_000 }, () => {
-  it("lists all six tools", async () => {
+  it("lists all seven tools", async () => {
     const { tools } = await request<{ tools: Array<{ name: string }> }>("tools/list");
     expect(tools.map((t) => t.name).sort()).toEqual([
       "local_analyze",
       "local_cancel",
       "local_implement",
+      "local_job_log",
       "local_review",
       "local_worker_status",
       "run_local_agent",
@@ -252,8 +270,90 @@ describe("MCP server with two workers", { timeout: 20_000 }, () => {
     });
     const text = result.content[0]!.text;
     expect(text).toMatch(/\| mode implement \| status completed\]/);
+    expect(text).toMatch(/\| 2→2 tok \|/); // both mocks report 1/1 per call, two calls
     expect(text).toContain("A\tworker.txt");
     await expect(fs.access(path.join(tempDir, "worker.txt"))).rejects.toThrow();
+  });
+
+  it("records a failed job's partial transcript when the backend errors mid-job", async () => {
+    const result = await callTool("run_local_agent", {
+      prompt: "fail: x loop: y",
+      mode: "analyze",
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/500/);
+
+    const status = JSON.parse((await callTool("local_worker_status")).content[0]!.text) as {
+      metrics: { jobs: Record<string, number> };
+    };
+    expect(status.metrics.jobs.failed).toBeGreaterThanOrEqual(1);
+
+    const ids = await fs.readdir(jobsDir);
+    const failed = (
+      await Promise.all(ids.map(async (id) => ({ id, record: await readResult(id) })))
+    ).find((r) => r.record.status === "failed")!;
+    expect(failed.record).toMatchObject({ status: "failed", iterations: 2, tool_calls: 1 });
+    const transcript = (
+      await fs.readFile(path.join(jobsDir, failed.id, "transcript.jsonl"), "utf-8")
+    )
+      .trim()
+      .split("\n");
+    expect(transcript.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("writes a job record and serves it through local_job_log", async () => {
+    const result = await callTool("local_implement", {
+      objective: "write: create worker.txt",
+      paths: ["a.txt"],
+      acceptance_criteria: ["worker.txt exists"],
+      test_commands: [],
+    });
+    const jobId = /job ([0-9a-f]{8})/.exec(result.content[0]!.text)![1]!;
+
+    const record = await readResult(jobId);
+    expect(record).toMatchObject({
+      job_id: jobId,
+      status: "completed",
+      files_changed: ["worker.txt"],
+      tool_calls: 1,
+      usage: { prompt_tokens: 2, completion_tokens: 2 },
+    });
+    expect((record.chars_returned as number) > 0).toBe(true);
+    expect((await fs.readdir(path.join(jobsDir, jobId))).sort()).toEqual([
+      "patch.diff",
+      "request.json",
+      "result.json",
+      "transcript.jsonl",
+    ]);
+    const transcript = (await fs.readFile(path.join(jobsDir, jobId, "transcript.jsonl"), "utf-8"))
+      .trim()
+      .split("\n");
+    expect(JSON.parse(transcript.at(-1)!)).toMatchObject({ role: "assistant", content: "done" });
+
+    const log = await callTool("local_job_log", { job_id: jobId, tail: 2 });
+    const parsed = JSON.parse(log.content[0]!.text) as {
+      request: { tool: string };
+      transcript: unknown[];
+    };
+    expect(parsed.request.tool).toBe("local_implement");
+    expect(parsed.transcript).toHaveLength(2);
+
+    const missing = await callTool("local_job_log", { job_id: "00000000" });
+    expect(missing.isError).toBe(true);
+
+    const status = JSON.parse((await callTool("local_worker_status")).content[0]!.text) as {
+      workers: Array<{ jobs: number; tokens: { prompt: number } }>;
+      metrics: {
+        jobs: Record<string, number>;
+        supervisor_context_saved_chars: number;
+        tokens: { prompt: number };
+      };
+    };
+    expect(status.metrics.jobs.started).toBeGreaterThanOrEqual(2);
+    expect(status.metrics.jobs.completed).toBeGreaterThanOrEqual(2);
+    expect(status.metrics.tokens.prompt).toBeGreaterThan(0);
+    expect(status.metrics.supervisor_context_saved_chars).toBeGreaterThanOrEqual(0);
+    expect(status.workers.some((w) => w.jobs >= 1 && w.tokens.prompt > 0)).toBe(true);
   });
 
   it("local_review needs a diff or paths, and passes the diff through", async () => {
@@ -379,23 +479,16 @@ describe("MCP server with two workers", { timeout: 20_000 }, () => {
 
   it("reports a dead worker and keeps working on the live one", async () => {
     const before = JSON.parse((await callTool("local_worker_status")).content[0]!.text);
-    expect(before).toEqual({
-      workers: [
-        { id: "gpu0", status: "idle", model: "m", provider: "ollama" },
-        { id: "gpu1", status: "idle", model: "m", provider: "openai" },
-      ],
-      queued: 0,
-    });
+    expect(before.queued).toBe(0);
+    expect(before.workers).toMatchObject([
+      { id: "gpu0", status: "idle", model: "m", provider: "ollama" },
+      { id: "gpu1", status: "idle", model: "m", provider: "openai" },
+    ]);
 
     await stopMock(gpu1);
 
     const after = JSON.parse((await callTool("local_worker_status")).content[0]!.text);
-    expect(after.workers[1]).toEqual({
-      id: "gpu1",
-      status: "unhealthy",
-      model: "m",
-      provider: "openai",
-    });
+    expect(after.workers[1]).toMatchObject({ id: "gpu1", status: "unhealthy", provider: "openai" });
 
     const result = await callTool("run_local_agent", { prompt: "a" });
     expect(result.isError).toBeFalsy();
