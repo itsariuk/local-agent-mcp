@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { checkHealth, chatWithOllama } from "../ollama.js";
+import { checkHealth, chatWithOllama, OllamaProvider } from "../ollama.js";
 
 // ---------------------------------------------------------------------------
 // Mock server helper
@@ -30,6 +30,42 @@ describe("chatWithOllama", () => {
     await expect(chatWithOllama(url, request, AbortSignal.timeout(100))).rejects.toMatchObject({
       name: "TimeoutError",
     });
+  });
+});
+
+describe("OllamaProvider", () => {
+  it("maps jsonOnly/numCtx onto the request and token counts onto usage", async () => {
+    let body: Record<string, unknown> = {};
+    const url = await listen((req, res) => {
+      let raw = "";
+      req.on("data", (chunk: Buffer) => (raw += chunk.toString()));
+      req.on("end", () => {
+        body = JSON.parse(raw);
+        res.end(
+          JSON.stringify({
+            message: { role: "assistant", content: "ok" },
+            done: true,
+            prompt_eval_count: 7,
+            eval_count: 3,
+          }),
+        );
+      });
+    });
+
+    const result = await new OllamaProvider(url).chat({
+      model: "m",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [],
+      jsonOnly: true,
+      numCtx: 2048,
+    });
+
+    expect(body).toMatchObject({ model: "m", format: "json", options: { num_ctx: 2048 } });
+    expect(result).toEqual({
+      message: { role: "assistant", content: "ok" },
+      usage: { promptTokens: 7, completionTokens: 3 },
+    });
+    expect(new OllamaProvider(url).kind).toBe("ollama");
   });
 });
 

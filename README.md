@@ -75,7 +75,7 @@ All settings are controlled via environment variables. Set them in your MCP conf
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint. Defines a single worker named `default` |
+| `OLLAMA_HOST` | `http://localhost:11434` | Inference endpoint for the single default worker. A URL ending in `/v1` selects the OpenAI-compatible provider (see [Providers](#providers)) |
 | `AGENT_WORKERS` | *(unset)* | Several Ollama endpoints as `id=url,id=url` (e.g., `gpu0=http://host:11434,gpu1=http://host:11435`). Overrides `OLLAMA_HOST`. See [Multiple workers](#multiple-workers) |
 | `AGENT_MODEL` | `qwen2.5-coder:7b` | Model to use for agent tasks |
 | `AGENT_WORKING_DIR` | Current directory | Root directory for file operations |
@@ -84,7 +84,8 @@ All settings are controlled via environment variables. Set them in your MCP conf
 | `AGENT_SHELL_MODE` | `restricted` | `restricted` (allow-list), `full` (no restrictions, warning printed), or `none` (bash disabled) |
 | `AGENT_ALLOWED_COMMANDS` | *(empty)* | Comma-separated commands to add to the default allow-list (e.g., `rm,curl`) |
 | `AGENT_JOB_TIMEOUT_SECONDS` | `900` | Wall-clock limit per job once it has a worker; the job returns what it has when it expires |
-| `AGENT_NUM_CTX` | *(Ollama default)* | Context window, sent to Ollama as `options.num_ctx`. Set it for multi-step tasks (e.g., `32768`) — a small context silently drops earlier file reads |
+| `AGENT_NUM_CTX` | *(Ollama default)* | Context window, sent to Ollama as `options.num_ctx`. Set it for multi-step tasks (e.g., `32768`) — a small context silently drops earlier file reads. Ollama workers only; OpenAI-compatible servers set their context size themselves |
+| `AGENT_API_KEY` | *(unset)* | Sent as `Authorization: Bearer …` to OpenAI-compatible servers that require one |
 
 **Default allow-list** (when `AGENT_SHELL_MODE=restricted`): git, ls, cat, echo, grep, head, tail, wc, find, mkdir, cp, mv, touch, npm, node, python.
 
@@ -146,6 +147,25 @@ Set `AGENT_WORKERS` to run jobs on more than one Ollama endpoint — typically o
 - Every report starts with a line saying where it ran: `[worker gpu0 | qwen3.8:27b | job 3f2a1c9e | 17.8s | 3 iterations]`. The time includes any wait in the queue.
 - Pass `worker: "gpu1"` to `run_local_agent` to target one worker, for diagnostics.
 - All workers use `AGENT_MODEL`.
+
+### Providers
+
+Each worker talks to one of two backends, chosen from its URL:
+
+| URL | Provider | Endpoints used |
+|-----|----------|----------------|
+| `http://host:11434` (anything not ending in `/v1`) | Ollama native API | `POST /api/chat`, `GET /api/version` |
+| `http://host:8001/v1` (ends in `/v1`) | OpenAI-compatible chat completions | `POST /v1/chat/completions`, `GET /v1/models` |
+
+The OpenAI-compatible provider is for vLLM, llama.cpp `server`, LM Studio, and Ollama's own `/v1` endpoint. Mixing is fine:
+
+```
+AGENT_WORKERS=gpu0=http://gpu-host:11434,gpu1=http://gpu-host:8001/v1
+```
+
+Verified so far: Ollama's native API and Ollama's `/v1` endpoint (same model, both providers, live). vLLM, llama.cpp and LM Studio follow the same contract but have not been run against this server yet — if one misbehaves, the error text starts with `OpenAI-compatible server error:` and includes the first 200 characters of the server's reply.
+
+`local_worker_status` shows each worker's `provider`.
 
 With a single endpoint (just `OLLAMA_HOST`, or one entry in `AGENT_WORKERS`) you still get the queue and the health check: parallel calls line up instead of competing for the same GPU.
 
@@ -270,6 +290,10 @@ The agent tried to access a file outside its working directory. Set `AGENT_WORKI
 **Bash commands fail on Windows**
 
 Bash execution uses Unix process groups (`kill(-pid)`) which are not available on Windows. File tools (`read_file`, `write_file`, `replace_text`, `list_dir`) work on all platforms. Set `AGENT_SHELL_MODE=none` to disable bash entirely.
+
+### "no OpenAI-compatible server at …" / "OpenAI-compatible server error: 4xx"
+
+The worker's URL ends in `/v1`, so the server is expected to speak the OpenAI chat-completions API. Check that it is running, that the model name in `AGENT_MODEL` matches what `GET /v1/models` lists, and set `AGENT_API_KEY` if the server requires a token. A 400 mentioning `tools` usually means the loaded model has no tool-calling support.
 
 ### "no healthy worker available"
 

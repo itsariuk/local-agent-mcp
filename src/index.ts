@@ -9,6 +9,7 @@ import { loadConfig, ConfigError } from "./config.js";
 import type { AppConfig } from "./config.js";
 import { WorkerPool } from "./pool.js";
 import { analyzePrompt, implementPrompt, reviewPrompt } from "./prompts.js";
+import { createProvider } from "./provider.js";
 
 // ---------------------------------------------------------------------------
 // Configuration (fail-fast on invalid env vars)
@@ -29,7 +30,7 @@ try {
 // Job runner shared by every job tool
 // ---------------------------------------------------------------------------
 
-const pool = new WorkerPool(config.workers);
+const pool = new WorkerPool(config.workers, (w) => createProvider(w, config.apiKey).health());
 const workerIds = config.workers.map((w) => w.id).join(", ");
 
 type Mode = "analyze" | "implement" | "direct";
@@ -52,6 +53,7 @@ async function runJob(args: JobArgs, clientSignal: AbortSignal): Promise<string>
   return pool.run(
     async (w, jobId, jobSignal) => {
       const model = args.model ?? w.model;
+      const provider = createProvider(w, config.apiKey);
       const wt = mode === "implement" ? await createWorktree(config.workingDir, jobId) : undefined;
       // The clock starts once the job has a worker, so queue time does not count
       const signal = AbortSignal.any([jobSignal, AbortSignal.timeout(timeoutMs)]);
@@ -61,7 +63,7 @@ async function runJob(args: JobArgs, clientSignal: AbortSignal): Promise<string>
         result = await runAgentLoop({
           prompt,
           model,
-          host: w.host,
+          provider,
           workingDir: wt ? path.join(wt.path, wt.relativeDir) : config.workingDir,
           maxIterations,
           shellMode: config.shellMode,
@@ -275,8 +277,13 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    `local-agent-mcp | dir: ${config.workingDir} | model: ${config.model} | shell: ${config.shellMode} | workers: ${config.workers.map((w) => `${w.id}=${w.host}`).join(", ")} | ctx: ${config.numCtx ?? "default"} | job timeout: ${config.jobTimeoutMs / 1000}s`,
+    `local-agent-mcp | dir: ${config.workingDir} | model: ${config.model} | shell: ${config.shellMode} | workers: ${config.workers.map((w) => `${w.id}=${w.host} (${w.provider})`).join(", ")} | ctx: ${config.numCtx ?? "default"} | job timeout: ${config.jobTimeoutMs / 1000}s`,
   );
+  if (config.numCtx !== undefined && config.workers.some((w) => w.provider === "openai")) {
+    console.error(
+      "[config] AGENT_NUM_CTX applies to Ollama workers only; set the context size on OpenAI-compatible servers themselves",
+    );
+  }
 }
 
 main().catch((err: unknown) => {

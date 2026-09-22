@@ -2,20 +2,22 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { chatWithOllama } from "../ollama.js";
-import type { OllamaChatResponse, OllamaMessage } from "../ollama.js";
+import type { OllamaMessage } from "../ollama.js";
+import type { ChatRequest, ChatResponse, InferenceProvider } from "../provider.js";
+import { toOpenAIMessages } from "../provider.js";
 import { runAgentLoop, formatAgentResult, formatDiff, jobStatus } from "../loop.js";
 import type { AgentResult } from "../loop.js";
 
-vi.mock("../ollama.js", () => ({ chatWithOllama: vi.fn() }));
-const chat = vi.mocked(chatWithOllama);
+// A fake provider: the loop must not care what is behind it
+const chat = vi.fn<(request: ChatRequest, signal?: AbortSignal) => Promise<ChatResponse>>();
+const provider: InferenceProvider = { kind: "ollama", chat, health: async () => true };
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function reply(message: Partial<OllamaMessage>): OllamaChatResponse {
-  return { message: { role: "assistant", content: "", ...message }, done: true };
+function reply(message: Partial<OllamaMessage>): ChatResponse {
+  return { message: { role: "assistant", content: "", ...message } };
 }
 
 const readCall = (file: string) =>
@@ -35,7 +37,7 @@ function run(
   return runAgentLoop({
     prompt: "do the thing",
     model: "m",
-    host: "http://x",
+    provider,
     workingDir: tempDir,
     maxIterations: 5,
     shellMode: "none",
@@ -98,7 +100,7 @@ describe("runAgentLoop", () => {
     expect(result.finalMessage).toBe("Recovered.");
     expect(chat).toHaveBeenCalledTimes(3);
     // Only the correction call asks for bare JSON
-    expect(chat.mock.calls[1]![1].format).toBe("json");
+    expect(chat.mock.calls[1]![0].jsonOnly).toBe(true);
   });
 
   it("does not re-run a tool call quoted inside the final report", async () => {
@@ -152,7 +154,7 @@ describe("runAgentLoop", () => {
 
     const result = await run({ readOnly: true });
 
-    const request = chat.mock.calls[0]![1];
+    const request = chat.mock.calls[0]![0];
     expect(request.tools!.map((t) => t.function.name)).toEqual(["read_file", "list_dir", "bash"]);
     expect(request.messages[0]!.content).toContain("read-only");
     expect(result.steps[0]!.result.output).toContain("read-only");
@@ -173,7 +175,7 @@ describe("runAgentLoop", () => {
     expect(result.aborted).toBe("cancelled");
     expect(result.finalMessage).toBe("");
     expect(chat).toHaveBeenCalledTimes(2);
-    expect(chat.mock.calls[0]![2]).toBe(controller.signal);
+    expect(chat.mock.calls[0]![1]).toBe(controller.signal);
   });
 
   it("reports cancelled, not parse_failed, when aborted during correction retries", async () => {
@@ -240,19 +242,56 @@ describe("runAgentLoop", () => {
 
     await run();
 
-    expect(chat.mock.calls[0]![1].format).toBeUndefined();
-    const toolMessage = chat.mock.calls[1]![1].messages.find((m) => m.role === "tool");
+    expect(chat.mock.calls[0]![0].jsonOnly).toBeUndefined();
+    const toolMessage = chat.mock.calls[1]![0].messages.find((m) => m.role === "tool");
     expect(toolMessage).toMatchObject({ tool_name: "read_file", content: "hello world" });
   });
 
-  it("forwards numCtx as options.num_ctx only when set", async () => {
+  it("attaches text-extracted tool calls to the assistant message in history", async () => {
+    chat.mockResolvedValueOnce(
+      reply({ content: '{"name":"read_file","parameters":{"path":"test.txt"}}' }),
+    );
+    chat.mockResolvedValueOnce(reply({ content: "Done." }));
+
+    await run();
+
+    const history = chat.mock.calls[1]![0].messages;
+    const assistant = history.find((m) => m.role === "assistant")!;
+    expect(assistant.tool_calls).toEqual([
+      { function: { name: "read_file", arguments: { path: "test.txt" } } },
+    ]);
+    // and the OpenAI translation of that history is well-formed
+    const wire = toOpenAIMessages(history);
+    const wireAssistant = wire.find((m) => m.role === "assistant")!;
+    const wireTool = wire.find((m) => m.role === "tool")!;
+    expect(wireAssistant.tool_calls![0]!.id).toBe("call_0");
+    expect(wireTool.tool_call_id).toBe("call_0");
+  });
+
+  it("echoes the call id on the tool result when the backend gave one", async () => {
+    chat.mockResolvedValueOnce(
+      reply({
+        tool_calls: [
+          { id: "call_7", function: { name: "read_file", arguments: { path: "test.txt" } } },
+        ],
+      }),
+    );
+    chat.mockResolvedValueOnce(reply({ content: "Done." }));
+
+    await run();
+
+    const toolMessage = chat.mock.calls[1]![0].messages.find((m) => m.role === "tool");
+    expect(toolMessage).toMatchObject({ tool_call_id: "call_7", tool_name: "read_file" });
+  });
+
+  it("forwards numCtx only when set", async () => {
     chat.mockResolvedValue(reply({ content: "Done." }));
 
     await run({ numCtx: 8192 });
     await run();
 
-    expect(chat.mock.calls[0]![1].options).toEqual({ num_ctx: 8192 });
-    expect(chat.mock.calls[1]![1].options).toBeUndefined();
+    expect(chat.mock.calls[0]![0].numCtx).toBe(8192);
+    expect(chat.mock.calls[1]![0].numCtx).toBeUndefined();
   });
 
   it("clips large tool output for the model but keeps it in steps", async () => {
@@ -262,7 +301,7 @@ describe("runAgentLoop", () => {
 
     const result = await run();
 
-    const toolMessage = chat.mock.calls[1]![1].messages.find((m) => m.role === "tool")!;
+    const toolMessage = chat.mock.calls[1]![0].messages.find((m) => m.role === "tool")!;
     expect(toolMessage.content.length).toBeLessThan(16_100);
     expect(toolMessage.content).toContain("[... clipped");
     expect(result.steps[0]!.result.output).toHaveLength(50_000);

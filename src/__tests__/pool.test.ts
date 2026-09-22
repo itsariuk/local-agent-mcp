@@ -7,8 +7,8 @@ import type { WorkerConfig } from "../config.js";
 // ---------------------------------------------------------------------------
 
 const W: WorkerConfig[] = [
-  { id: "gpu0", host: "http://a", model: "m" },
-  { id: "gpu1", host: "http://b", model: "m" },
+  { id: "gpu0", host: "http://a", model: "m", provider: "ollama" },
+  { id: "gpu1", host: "http://b", model: "m", provider: "ollama" },
 ];
 
 const healthy = async () => true;
@@ -149,7 +149,7 @@ describe("WorkerPool scheduling", () => {
 
 describe("WorkerPool health", () => {
   it("fails over to the next worker at dispatch and reports the dead one", async () => {
-    const pool = new WorkerPool(W, async (host) => host !== "http://a");
+    const pool = new WorkerPool(W, async (w) => w.host !== "http://a");
     expect(await pool.run(async (w) => w.id)).toBe("gpu1");
 
     const { workers } = await pool.status();
@@ -271,7 +271,12 @@ describe("WorkerPool cancellation and status", () => {
     const run = pool.run(async (w) => w.id);
     await tick();
 
-    expect((await pool.status()).workers[0]).toEqual({ id: "gpu0", status: "probing", model: "m" });
+    expect((await pool.status()).workers[0]).toEqual({
+      id: "gpu0",
+      status: "probing",
+      model: "m",
+      provider: "ollama",
+    });
 
     answer(true);
     expect(await run).toBe("gpu0");
@@ -289,7 +294,7 @@ describe("WorkerPool cancellation and status", () => {
     expect(busy).toMatchObject({ status: "busy", model: "m" });
     expect(busy.job_id).toMatch(/^[0-9a-f]{8}$/);
     expect(busy.busy_seconds).toBeTypeOf("number");
-    expect(idle).toEqual({ id: idle.id, status: "idle", model: "m" });
+    expect(idle).toEqual({ id: idle.id, status: "idle", model: "m", provider: "ollama" });
 
     a.open();
     await a.done;

@@ -2,8 +2,8 @@
 // Health is probed at dispatch only: no timers, no background state.
 
 import { randomUUID } from "node:crypto";
-import { checkHealth } from "./ollama.js";
-import type { WorkerConfig } from "./config.js";
+import type { WorkerConfig, ProviderKind } from "./config.js";
+import { createProvider } from "./provider.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -11,7 +11,9 @@ import type { WorkerConfig } from "./config.js";
 
 export type WorkerStatus = "idle" | "busy" | "unhealthy";
 
-export type HealthFn = (host: string) => Promise<boolean>;
+export type HealthFn = (worker: WorkerConfig) => Promise<boolean>;
+
+const defaultHealth: HealthFn = (worker) => createProvider(worker).health();
 
 // snake_case: this is the JSON the supervisor reads
 export interface WorkerSnapshot {
@@ -19,6 +21,7 @@ export interface WorkerSnapshot {
   // "probing": claimed for a job whose health probe has not answered yet
   status: WorkerStatus | "probing";
   model: string;
+  provider: ProviderKind;
   job_id?: string;
   busy_seconds?: number;
 }
@@ -57,7 +60,7 @@ export class WorkerPool {
 
   constructor(
     configs: readonly WorkerConfig[],
-    private readonly healthFn: HealthFn = checkHealth,
+    private readonly healthFn: HealthFn = defaultHealth,
   ) {
     this.workers = configs.map((c) => ({ ...c, status: "idle" as const }));
   }
@@ -79,7 +82,7 @@ export class WorkerPool {
       const tried = new Set<string>();
       let worker = this.claim(workerId, tried);
       while (worker) {
-        if (await this.healthFn(worker.host)) return await this.execute(worker, job, signal);
+        if (await this.healthFn(worker)) return await this.execute(worker, job, signal);
         console.error(`[pool] worker ${worker.id} unhealthy at ${worker.host}`);
         tried.add(worker.id);
         this.release(worker, "unhealthy");
@@ -91,7 +94,7 @@ export class WorkerPool {
       }
 
       worker = await this.enqueue(workerId, signal);
-      if (await this.healthFn(worker.host)) return await this.execute(worker, job, signal);
+      if (await this.healthFn(worker)) return await this.execute(worker, job, signal);
       console.error(`[pool] worker ${worker.id} unhealthy at ${worker.host}`);
       this.release(worker, "unhealthy");
     }
@@ -112,7 +115,7 @@ export class WorkerPool {
       this.workers
         .filter((w) => w.status !== "busy")
         .map(async (w) => {
-          const ok = await this.healthFn(w.host);
+          const ok = await this.healthFn(w);
           // A job may have claimed the worker while the probe was in flight
           if (w.status !== "busy") w.status = ok ? "idle" : "unhealthy";
         }),
@@ -123,6 +126,7 @@ export class WorkerPool {
         id: w.id,
         status: w.status === "busy" && w.jobId === undefined ? "probing" : w.status,
         model: w.model,
+        provider: w.provider,
         ...(w.jobId !== undefined && { job_id: w.jobId }),
         ...(w.busySince !== undefined && {
           busy_seconds: Math.round((Date.now() - w.busySince) / 1000),
@@ -161,7 +165,7 @@ export class WorkerPool {
       : worker.controller.signal;
     try {
       return await job(
-        { id: worker.id, host: worker.host, model: worker.model },
+        { id: worker.id, host: worker.host, model: worker.model, provider: worker.provider },
         worker.jobId,
         signal,
       );

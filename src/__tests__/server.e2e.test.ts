@@ -32,27 +32,32 @@ const WRITE_CALL = {
 // Mock Ollama
 // ---------------------------------------------------------------------------
 
+type Shape = "ollama" | "openai";
+
 interface MockOllama {
-  url: string;
+  url: string; // base URL as it goes into AGENT_WORKERS (…/v1 for the openai shape)
   server: http.Server;
   chats: number;
   maxInFlight: number;
   prompts: string[]; // user prompt of every chat request
+  toolCallIds: string[]; // tool_call_id seen on inbound tool messages (openai shape)
 }
 
-async function startMockOllama(): Promise<MockOllama> {
+/** Ollama's native shape, or the OpenAI chat-completions shape (string arguments, ids). */
+async function startMockOllama(shape: Shape = "ollama"): Promise<MockOllama> {
   let inFlight = 0;
   const mock: MockOllama = {
     url: "",
     chats: 0,
     maxInFlight: 0,
     prompts: [],
+    toolCallIds: [],
     server: http.createServer(),
   };
 
   mock.server.on("request", (req, res) => {
-    if (req.url === "/api/version") {
-      res.end('{"version":"mock"}');
+    if (req.url === "/api/version" || req.url === "/v1/models") {
+      res.end(shape === "openai" ? '{"data":[]}' : '{"version":"mock"}');
       return;
     }
     mock.chats++;
@@ -62,9 +67,10 @@ async function startMockOllama(): Promise<MockOllama> {
     req.on("data", (chunk: Buffer) => (body += chunk.toString()));
     req.on("end", () => {
       const { messages } = JSON.parse(body) as {
-        messages: Array<{ role: string; content: string }>;
+        messages: Array<{ role: string; content: string; tool_call_id?: string }>;
       };
       mock.prompts.push(messages[1]!.content);
+      for (const m of messages) if (m.tool_call_id) mock.toolCallIds.push(m.tool_call_id);
       const wantsWrite =
         messages[1]!.content.includes("write:") && !messages.some((m) => m.role === "tool");
       const wantsLoop = messages[1]!.content.includes("loop:");
@@ -82,11 +88,34 @@ async function startMockOllama(): Promise<MockOllama> {
         settle();
         if (res.destroyed) return;
         res.setHeader("Content-Type", "application/json");
+        const message = { role: "assistant", content: call ? "" : "done", ...call };
         res.end(
-          JSON.stringify({
-            message: { role: "assistant", content: call ? "" : "done", ...call },
-            done: true,
-          }),
+          JSON.stringify(
+            shape === "openai"
+              ? {
+                  choices: [
+                    {
+                      message: {
+                        role: "assistant",
+                        content: call ? null : "done",
+                        ...(call && {
+                          tool_calls: call.tool_calls.map((tc, i) => ({
+                            id: `call_${i}`,
+                            type: "function",
+                            function: {
+                              name: tc.function.name,
+                              arguments: JSON.stringify(tc.function.arguments),
+                            },
+                          })),
+                        }),
+                      },
+                      finish_reason: call ? "tool_calls" : "stop",
+                    },
+                  ],
+                  usage: { prompt_tokens: 1, completion_tokens: 1 },
+                }
+              : { message, done: true },
+          ),
         );
       }, CHAT_DELAY_MS);
       res.on("close", () => clearTimeout(timer));
@@ -95,7 +124,7 @@ async function startMockOllama(): Promise<MockOllama> {
   });
 
   await new Promise<void>((resolve) => mock.server.listen(0, "127.0.0.1", resolve));
-  mock.url = `http://127.0.0.1:${(mock.server.address() as AddressInfo).port}`;
+  mock.url = `http://127.0.0.1:${(mock.server.address() as AddressInfo).port}${shape === "openai" ? "/v1" : ""}`;
   return mock;
 }
 
@@ -135,7 +164,8 @@ let gpu1: MockOllama;
 let tempDir: string;
 
 beforeAll(async () => {
-  [gpu0, gpu1] = await Promise.all([startMockOllama(), startMockOllama()]);
+  // gpu0 speaks Ollama's native API, gpu1 the OpenAI-compatible one
+  [gpu0, gpu1] = await Promise.all([startMockOllama("ollama"), startMockOllama("openai")]);
   tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "e2e-test-"));
   await git(tempDir, "init", "-q");
   await fs.writeFile(path.join(tempDir, "a.txt"), "a\n");
@@ -334,12 +364,25 @@ describe("MCP server with two workers", { timeout: 20_000 }, () => {
     await fs.rm(path.join(tempDir, "worker.txt"));
   });
 
+  it("runs an implement job through the OpenAI-compatible worker with tool_call_id round-trip", async () => {
+    const result = await callTool("run_local_agent", {
+      prompt: "write: x",
+      mode: "implement",
+      worker: "gpu1",
+    });
+    const text = result.content[0]!.text;
+    expect(result.isError).toBeFalsy();
+    expect(text).toMatch(/^\[worker gpu1 .*\| mode implement \| status completed\]/);
+    expect(text).toContain("A\tworker.txt");
+    expect(gpu1.toolCallIds).toContain("call_0");
+  });
+
   it("reports a dead worker and keeps working on the live one", async () => {
     const before = JSON.parse((await callTool("local_worker_status")).content[0]!.text);
     expect(before).toEqual({
       workers: [
-        { id: "gpu0", status: "idle", model: "m" },
-        { id: "gpu1", status: "idle", model: "m" },
+        { id: "gpu0", status: "idle", model: "m", provider: "ollama" },
+        { id: "gpu1", status: "idle", model: "m", provider: "openai" },
       ],
       queued: 0,
     });
@@ -347,7 +390,12 @@ describe("MCP server with two workers", { timeout: 20_000 }, () => {
     await stopMock(gpu1);
 
     const after = JSON.parse((await callTool("local_worker_status")).content[0]!.text);
-    expect(after.workers[1]).toEqual({ id: "gpu1", status: "unhealthy", model: "m" });
+    expect(after.workers[1]).toEqual({
+      id: "gpu1",
+      status: "unhealthy",
+      model: "m",
+      provider: "openai",
+    });
 
     const result = await callTool("run_local_agent", { prompt: "a" });
     expect(result.isError).toBeFalsy();

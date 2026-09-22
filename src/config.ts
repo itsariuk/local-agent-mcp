@@ -2,7 +2,7 @@
  * Configuration module — reads environment variables at startup with
  * documented defaults and fail-fast validation.
  *
- * Covers CONF-01 through CONF-10.
+ * Covers CONF-01 through CONF-11.
  */
 
 import { DEFAULT_ALLOWED_COMMANDS } from "./security.js";
@@ -23,10 +23,13 @@ export class ConfigError extends Error {
 // AppConfig
 // ---------------------------------------------------------------------------
 
+export type ProviderKind = "ollama" | "openai";
+
 export interface WorkerConfig {
   id: string;
   host: string;
   model: string;
+  provider: ProviderKind;
 }
 
 export interface AppConfig {
@@ -39,6 +42,7 @@ export interface AppConfig {
   allowedCommands: readonly string[];
   numCtx?: number;
   jobTimeoutMs: number;
+  apiKey?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +65,13 @@ function parsePositiveInt(envKey: string, defaultValue: number): number {
 
 const WORKER_ID = /^[\w-]+$/;
 
+// A base URL ending in /v1 is an OpenAI-compatible server (vLLM, llama.cpp,
+// LM Studio, Ollama's own /v1); anything else is Ollama's native API.
+function workerFor(id: string, url: string, model: string): WorkerConfig {
+  const host = url.replace(/\/+$/, "");
+  return { id, host, model, provider: /\/v1$/.test(host) ? "openai" : "ollama" };
+}
+
 function parseWorkers(raw: string, model: string): WorkerConfig[] {
   const expected = "id=http://host:port[,id=http://host:port...]";
   const workers: WorkerConfig[] = [];
@@ -78,7 +89,7 @@ function parseWorkers(raw: string, model: string): WorkerConfig[] {
     ) {
       throw new ConfigError("AGENT_WORKERS", raw, expected);
     }
-    workers.push({ id, host: url.replace(/\/+$/, ""), model });
+    workers.push(workerFor(id, url, model));
   }
   return workers;
 }
@@ -96,7 +107,7 @@ export function loadConfig(): AppConfig {
   const workers =
     rawWorkers !== undefined
       ? parseWorkers(rawWorkers, model)
-      : [{ id: "default", host: process.env.OLLAMA_HOST ?? "http://localhost:11434", model }];
+      : [workerFor("default", process.env.OLLAMA_HOST ?? "http://localhost:11434", model)];
 
   // CONF-03
   const workingDir = process.env.AGENT_WORKING_DIR ?? process.cwd();
@@ -132,6 +143,9 @@ export function loadConfig(): AppConfig {
   // CONF-10: whole-job wall clock; the job returns what it has when it expires
   const jobTimeoutMs = parsePositiveInt("AGENT_JOB_TIMEOUT_SECONDS", 900) * 1000;
 
+  // CONF-11: bearer token for OpenAI-compatible servers that want one
+  const apiKey = process.env.AGENT_API_KEY || undefined;
+
   return {
     workers,
     model,
@@ -142,5 +156,6 @@ export function loadConfig(): AppConfig {
     allowedCommands,
     numCtx,
     jobTimeoutMs,
+    apiKey,
   };
 }

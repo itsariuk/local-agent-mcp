@@ -1,13 +1,18 @@
-// Ollama HTTP client — typed request/response with native fetch
+// Ollama HTTP client — typed request/response with native fetch.
+// These message types double as the internal chat format (see provider.ts).
+
+import type { ChatRequest, ChatResponse, InferenceProvider } from "./provider.js";
 
 export interface OllamaMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
   tool_calls?: OllamaToolCall[];
   tool_name?: string; // role:"tool" only — which tool produced this result
+  tool_call_id?: string; // role:"tool" only — id of the call being answered, when the backend gave one
 }
 
 export interface OllamaToolCall {
+  id?: string; // present on native calls from most backends; absent on text-extracted ones
   function: {
     name: string;
     arguments: Record<string, unknown>; // Pre-parsed object, NOT a JSON string
@@ -39,6 +44,8 @@ export interface OllamaChatRequest {
 export interface OllamaChatResponse {
   message: OllamaMessage;
   done: boolean;
+  prompt_eval_count?: number;
+  eval_count?: number;
 }
 
 export async function chatWithOllama(
@@ -88,5 +95,43 @@ export async function checkHealth(host: string, timeoutMs = HEALTH_TIMEOUT_MS): 
     return resp.ok;
   } catch {
     return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Provider wrapper
+// ---------------------------------------------------------------------------
+
+export class OllamaProvider implements InferenceProvider {
+  readonly kind = "ollama" as const;
+
+  constructor(private readonly host: string) {}
+
+  async chat(request: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
+    const response = await chatWithOllama(
+      this.host,
+      {
+        model: request.model,
+        messages: request.messages,
+        tools: request.tools,
+        stream: false,
+        ...(request.jsonOnly && { format: "json" as const }),
+        ...(request.numCtx && { options: { num_ctx: request.numCtx } }),
+      },
+      signal,
+    );
+    return {
+      message: response.message,
+      ...(response.prompt_eval_count !== undefined && {
+        usage: {
+          promptTokens: response.prompt_eval_count,
+          completionTokens: response.eval_count ?? 0,
+        },
+      }),
+    };
+  }
+
+  health(): Promise<boolean> {
+    return checkHealth(this.host);
   }
 }

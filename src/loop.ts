@@ -1,7 +1,7 @@
 // Agent loop — orchestrates Ollama calls and tool execution.
 
-import { chatWithOllama } from "./ollama.js";
 import type { OllamaMessage, OllamaToolCall } from "./ollama.js";
+import type { InferenceProvider } from "./provider.js";
 import { executeTool, toolDefinitions } from "./tools.js";
 import type { ToolResult } from "./tools.js";
 import type { ShellMode } from "./security.js";
@@ -81,7 +81,7 @@ function clipForModel(output: string): string {
 export async function runAgentLoop(options: {
   prompt: string;
   model: string;
-  host: string;
+  provider: InferenceProvider;
   workingDir: string;
   maxIterations: number;
   shellMode: ShellMode;
@@ -94,7 +94,7 @@ export async function runAgentLoop(options: {
   const {
     prompt,
     model,
-    host,
+    provider,
     workingDir,
     maxIterations,
     shellMode,
@@ -115,8 +115,6 @@ export async function runAgentLoop(options: {
 
   const tools = toolDefinitions(readOnly);
 
-  const ollamaOptions = numCtx ? { options: { num_ctx: numCtx } } : {};
-
   const messages: OllamaMessage[] = [
     { role: "system", content: readOnly ? ANALYZE_PROMPT : SYSTEM_PROMPT },
     { role: "user", content: prompt },
@@ -129,16 +127,8 @@ export async function runAgentLoop(options: {
 
   // chatFn for parser retry loop — isolated from main conversation history (per D-03)
   const chatFn = async (correctionMessages: OllamaMessage[]): Promise<OllamaMessage> => {
-    const response = await chatWithOllama(
-      host,
-      {
-        model,
-        messages: correctionMessages,
-        tools,
-        stream: false as const,
-        format: "json",
-        ...ollamaOptions,
-      },
+    const response = await provider.chat(
+      { model, messages: correctionMessages, tools, jsonOnly: true, numCtx },
       signal,
     );
     return response.message;
@@ -150,11 +140,7 @@ export async function runAgentLoop(options: {
 
     let assistantMessage: OllamaMessage;
     try {
-      const response = await chatWithOllama(
-        host,
-        { model, messages, tools, stream: false as const, ...ollamaOptions },
-        signal,
-      );
+      const response = await provider.chat({ model, messages, tools, numCtx }, signal);
       assistantMessage = response.message;
     } catch (err) {
       if (signal?.aborted) break; // cancelled/timed out mid-request: keep what we have
@@ -207,6 +193,11 @@ export async function runAgentLoop(options: {
       break;
     }
 
+    // Text-extracted calls must live on the assistant message too, or the
+    // history is inconsistent: OpenAI-compatible servers reject a tool result
+    // that does not follow an assistant message carrying that call.
+    assistantMessage.tool_calls = toolCalls;
+
     // Log iteration to stderr
     console.error(`[agent] iteration ${iteration}: ${toolCalls.length} tool call(s)`);
 
@@ -233,6 +224,7 @@ export async function runAgentLoop(options: {
       messages.push({
         role: "tool",
         tool_name: name,
+        ...(tc.id && { tool_call_id: tc.id }),
         content: clipForModel(result.output),
       });
     }

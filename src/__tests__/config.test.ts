@@ -17,6 +17,7 @@ const ENV_KEYS = [
   "AGENT_NUM_CTX",
   "AGENT_WORKERS",
   "AGENT_JOB_TIMEOUT_SECONDS",
+  "AGENT_API_KEY",
 ] as const;
 
 function snapshotEnv(): Record<string, string | undefined> {
@@ -63,8 +64,14 @@ describe("loadConfig", () => {
     setup();
     const config = loadConfig();
     expect(config.workers).toEqual([
-      { id: "default", host: "http://localhost:11434", model: "qwen2.5-coder:7b" },
+      {
+        id: "default",
+        host: "http://localhost:11434",
+        model: "qwen2.5-coder:7b",
+        provider: "ollama",
+      },
     ]);
+    expect(config.apiKey).toBeUndefined();
     expect(config.model).toBe("qwen2.5-coder:7b");
     expect(config.workingDir).toBe(process.cwd());
     expect(config.maxIterations).toBe(20);
@@ -124,9 +131,27 @@ describe("loadConfig", () => {
   it("AGENT_WORKERS defines several workers, trimmed, sharing AGENT_MODEL", () => {
     setup({ AGENT_WORKERS: "gpu0=http://a:11434, gpu1=http://a:11435/", AGENT_MODEL: "m" });
     expect(loadConfig().workers).toEqual([
-      { id: "gpu0", host: "http://a:11434", model: "m" },
-      { id: "gpu1", host: "http://a:11435", model: "m" },
+      { id: "gpu0", host: "http://a:11434", model: "m", provider: "ollama" },
+      { id: "gpu1", host: "http://a:11435", model: "m", provider: "ollama" },
     ]);
+  });
+
+  it("a base URL ending in /v1 selects the OpenAI-compatible provider", () => {
+    setup({ AGENT_WORKERS: "gpu0=http://a:11434,gpu1=http://a:8001/v1/", AGENT_MODEL: "m" });
+    expect(loadConfig().workers.map((w) => [w.provider, w.host])).toEqual([
+      ["ollama", "http://a:11434"],
+      ["openai", "http://a:8001/v1"],
+    ]);
+  });
+
+  it("OLLAMA_HOST pointing at /v1 gives a single OpenAI-compatible worker", () => {
+    setup({ OLLAMA_HOST: "http://a:11434/v1" });
+    expect(loadConfig().workers[0]!.provider).toBe("openai");
+  });
+
+  it("AGENT_API_KEY sets apiKey", () => {
+    setup({ AGENT_API_KEY: "k" });
+    expect(loadConfig().apiKey).toBe("k");
   });
 
   it("AGENT_WORKERS wins over OLLAMA_HOST", () => {
