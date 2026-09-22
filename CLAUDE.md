@@ -79,7 +79,7 @@ step log tell you what actually ran.
 ### Model Selection
 
 The local agent uses the model set in `AGENT_MODEL` (see Configuration in README).
-Override per-call by including the model name in the prompt when a task needs more power:
+Override per-call with the `model` argument on any job tool when a task needs more power:
 
 | Task complexity | Suggested model size |
 |----------------|---------------------|
@@ -87,8 +87,7 @@ Override per-call by including the model name in the prompt when a task needs mo
 | Multi-step implementation, pattern matching | Mid-size model |
 | Complex logic, architectural refactor | Largest available model |
 
-To override, include in the run_local_agent prompt:
-`"Use model [model-name] for this task."`
+To override, pass `model: "<model-name>"` on the tool call (works on every job tool).
 
 Check available models with `ollama list`.
 
@@ -143,7 +142,7 @@ in parallel.
 - `replace_text` — exact, unique-match edit of part of a file (preferred for small changes)
 - `list_dir` — list directory contents
 - `bash` — run shell commands (restricted mode by default: git, ls, cat, echo, grep,
-  head, tail, wc, find, mkdir, cp, mv, touch, npm, node, python; every segment of a
+  head, tail, wc, find, mkdir, cp, mv, touch, npm, npx, node, python; every segment of a
   chained command is checked). In analyze mode only inspection commands are allowed.
 
 It cannot: spawn subagents, call external APIs, access GSD tools, or write to

@@ -1,18 +1,27 @@
 # local-agent-mcp
 
-An MCP server that lets Claude Code delegate tasks to a local Ollama model. The local agent can read files, write files, list directories, and execute shell commands — completing multi-step coding tasks without any cloud API calls.
+An MCP server that lets a frontier coding agent (Claude Code, Codex, or any MCP client) delegate bounded work to local models running on your own GPUs. Local workers explore the repository, implement changes in isolated git worktrees, run tests, and review diffs; the supervisor keeps the reasoning and gets back a concise report instead of every file read and shell output.
+
+What you get:
+
+- **Semantic tools** — `local_analyze` (read-only investigation), `local_implement` (edits in a throwaway git worktree, returned as a diff), `local_review` (independent review), plus free-form `run_local_agent`
+- **A worker pool** — one job per GPU at a time, health checks, queueing, `local_worker_status`
+- **Safety** — enforced read-only mode, worktree isolation, a chained-command-aware shell allow-list, timeouts and `local_cancel`
+- **Two backends** — Ollama's native API and any OpenAI-compatible server (vLLM, llama.cpp, LM Studio)
+- **Records** — every job leaves request, result, transcript and patch on disk; token and timing metrics per worker
 
 ## Prerequisites
 
-- **Node.js** 18 or later
-- **Ollama** installed and running (`ollama serve`)
-- A pulled model: `ollama pull qwen2.5-coder:7b`
+- **Node.js** 20.3 or later (the server uses `AbortSignal.any`)
+- **Ollama** installed and running (`ollama serve`), or an OpenAI-compatible inference server — see [Providers](#providers)
+- A pulled tool-calling model: `ollama pull qwen2.5-coder:7b` to start, `qwen3.8:27b` for real work (see [Supported Models](#supported-models))
+- **git** on the PATH — `local_implement` isolates each job in a `git worktree`
 - **Mac or Linux** (Windows: file tools work, but bash execution is not supported — see [Troubleshooting](#troubleshooting))
 
 ## Installation
 
 ```bash
-git clone https://github.com/stupakzm/local-agent-mcp.git
+git clone https://github.com/itsariuk/local-agent-mcp.git
 cd local-agent-mcp
 npm install
 npm run build
@@ -44,30 +53,37 @@ The `env` block is optional — see [Configuration](#configuration) for all avai
 
 ## Usage
 
-Once registered, Claude Code exposes a `run_local_agent` tool. Ask Claude to use it with a natural language prompt — the local agent handles the rest.
+Once registered, the supervisor sees seven tools (full reference in [Tools](#tools)). Ask it in natural language; the included `CLAUDE.md` teaches Claude Code which tool to reach for.
 
-**Basic example — summarize a file:**
+**Investigate — `local_analyze`:**
 
-> Use the local_agent tool to read `src/index.ts` and give me a one-paragraph summary of what it does.
+> Use local_analyze to find every call site of `assertPathSafe` under `src/` and report file:line for each.
 
-The agent reads the file using its `read_file` tool and returns a summary — no cloud API calls involved.
+Runs read-only against your checkout and returns findings with evidence. Safe to run several in parallel.
 
-**Multi-step example — find and explain:**
+**Change — `local_implement`:**
 
-> Use the local_agent tool to find all TypeScript files in `src/` and explain the purpose of each one.
+> Use local_implement: objective "add a byte-total line to list_dir output", paths `src/tools.ts` and `src/__tests__/tools.test.ts`, acceptance criteria "existing lines unchanged" and "tools tests pass", test command `npx vitest run src/__tests__/tools.test.ts`.
 
-The agent lists the directory, reads each file, and produces the explanation in a single run.
+Runs in a throwaway git worktree seeded with your uncommitted changes, runs the tests there, and returns a report plus a unified diff. Your checkout is never touched — apply the diff with `git apply` when you are happy with it.
 
-**Code task example — run tests and report:**
+**Review — `local_review`:**
 
-> Use the local_agent tool to run `npm test` and summarize which tests passed and which failed.
+> Use local_review on this diff with focus "correctness" and "tests".
 
-The agent executes the command (requires `AGENT_SHELL_MODE=restricted` or `full`) and returns the output.
+Returns issues with severity and file:line, suggested fixes, test gaps, and a confidence level — a cheap way to keep a second GPU busy while the first implements.
+
+**Anything else — `run_local_agent`:**
+
+> Use run_local_agent to run `npm test` and report which tests failed. Do not attempt fixes.
+
+Free-form; `mode` picks read-only, worktree, or in-place editing (default).
 
 **Tips:**
-- Be specific about paths — the agent works relative to `AGENT_WORKING_DIR` (defaults to the directory the server was started in)
-- Keep tasks focused — the agent stops after `AGENT_MAX_ITERATIONS` tool-call rounds (default 20)
-- For long tasks, increase `AGENT_MAX_ITERATIONS` in your MCP config `env` block
+- Give every job a bounded objective, explicit paths, and a done condition; vague objectives make small models loop
+- Paths are relative to `AGENT_WORKING_DIR` (defaults to the directory the server was started in)
+- Jobs stop after `AGENT_MAX_ITERATIONS` tool-call rounds (default 20) or `AGENT_JOB_TIMEOUT_SECONDS` (default 900); both can be overridden per call
+- Every result starts with a header naming the worker, job id, elapsed time, tokens and `status` — read the status before trusting the report
 
 ## Configuration
 
@@ -76,7 +92,7 @@ All settings are controlled via environment variables. Set them in your MCP conf
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OLLAMA_HOST` | `http://localhost:11434` | Inference endpoint for the single default worker. A URL ending in `/v1` selects the OpenAI-compatible provider (see [Providers](#providers)) |
-| `AGENT_WORKERS` | *(unset)* | Several Ollama endpoints as `id=url,id=url` (e.g., `gpu0=http://host:11434,gpu1=http://host:11435`). Overrides `OLLAMA_HOST`. See [Multiple workers](#multiple-workers) |
+| `AGENT_WORKERS` | *(unset)* | Several inference endpoints as `id=url,id=url` (e.g., `gpu0=http://host:11434,gpu1=http://host:11435`). Overrides `OLLAMA_HOST`. See [Multiple workers](#multiple-workers) |
 | `AGENT_MODEL` | `qwen2.5-coder:7b` | Model to use for agent tasks |
 | `AGENT_WORKING_DIR` | Current directory | Root directory for file operations |
 | `AGENT_MAX_ITERATIONS` | `20` | Maximum tool-call rounds before stopping |
@@ -88,7 +104,7 @@ All settings are controlled via environment variables. Set them in your MCP conf
 | `AGENT_API_KEY` | *(unset)* | Sent as `Authorization: Bearer …` to OpenAI-compatible servers that require one |
 | `AGENT_JOB_LOG_DIR` | `$XDG_STATE_HOME/local-agent-mcp/jobs` (`~/.local/state/…`) | Where per-job records are written (see [Job records and metrics](#job-records-and-metrics)) |
 
-**Default allow-list** (when `AGENT_SHELL_MODE=restricted`): git, ls, cat, echo, grep, head, tail, wc, find, mkdir, cp, mv, touch, npm, node, python.
+**Default allow-list** (when `AGENT_SHELL_MODE=restricted`): git, ls, cat, echo, grep, head, tail, wc, find, mkdir, cp, mv, touch, npm, npx, node, python.
 
 Use `AGENT_ALLOWED_COMMANDS` to add commands to this list. For example, `AGENT_ALLOWED_COMMANDS=rm,curl` adds `rm` and `curl` while keeping all defaults.
 
@@ -133,7 +149,7 @@ Invalid values cause the server to exit immediately with a clear error message �
 
 ## Multiple workers
 
-Set `AGENT_WORKERS` to run jobs on more than one Ollama endpoint — typically one Ollama instance per GPU:
+Set `AGENT_WORKERS` to run jobs on more than one inference endpoint — typically one Ollama instance per GPU:
 
 ```json
 "env": {
@@ -143,11 +159,11 @@ Set `AGENT_WORKERS` to run jobs on more than one Ollama endpoint — typically o
 }
 ```
 
-- Each worker runs **one job at a time**. Parallel `run_local_agent` calls go to different workers; extra calls wait in a first-in, first-out queue.
-- A worker is probed (`GET /api/version`) before every job. A dead one is skipped and the job goes to the next worker. A job is never moved once it has started, because it may already have written files.
-- Every report starts with a line saying where it ran: `[worker gpu0 | qwen3.8:27b | job 3f2a1c9e | 17.8s | 3 iterations]`. The time includes any wait in the queue.
-- Pass `worker: "gpu1"` to `run_local_agent` to target one worker, for diagnostics.
-- All workers use `AGENT_MODEL`.
+- Each worker runs **one job at a time**. Parallel tool calls go to different workers; extra calls wait in a first-in, first-out queue.
+- A worker is probed (`GET /api/version`, or `GET /v1/models` for OpenAI-compatible servers) before every job. A dead one is skipped and the job goes to the next worker. A job is never moved once it has started, because it may already have written files.
+- Every report starts with a line saying where it ran: `[worker gpu0 | qwen3.8:27b | job 3f2a1c9e | 17.8s | 3 iterations | 6.1k→0.9k tok | mode analyze | status completed]`. The time includes any wait in the queue.
+- Pass `worker: "gpu1"` to any job tool to target one worker, for diagnostics.
+- All workers use `AGENT_MODEL` unless a call passes `model`.
 
 ### Providers
 
@@ -177,14 +193,20 @@ The `local_worker_status` tool shows the pool:
 ```json
 {
   "workers": [
-    { "id": "gpu0", "status": "busy", "model": "qwen3.8:27b", "job_id": "3f2a1c9e", "busy_seconds": 12 },
-    { "id": "gpu1", "status": "idle", "model": "qwen3.8:27b" }
+    { "id": "gpu0", "status": "busy", "model": "qwen3.8:27b", "provider": "ollama",
+      "job_id": "3f2a1c9e", "busy_seconds": 12,
+      "jobs": 7, "busy_seconds_total": 412, "tokens": { "prompt": 98210, "completion": 6120 } },
+    { "id": "gpu1", "status": "idle", "model": "qwen3.8:27b", "provider": "ollama",
+      "jobs": 5, "busy_seconds_total": 280, "tokens": { "prompt": 61004, "completion": 4090 } }
   ],
-  "queued": 0
+  "queued": 0,
+  "metrics": { "jobs": { "started": 12, "completed": 11, "cancelled": 1 }, "tokens": { "prompt": 159214, "completion": 10210 },
+               "tool_calls": 63, "chars_consumed": 412880, "chars_returned": 31200,
+               "supervisor_context_saved_chars": 381680, "since": "2026-09-21T18:02:11.000Z" }
 }
 ```
 
-`status` is `idle`, `busy`, `probing` (claimed for a job, health check still running), or `unhealthy` (the endpoint did not answer its last probe).
+`status` is `idle`, `busy`, `probing` (claimed for a job, health check still running), or `unhealthy` (the endpoint did not answer its last probe). The `metrics` block is described under [Job records and metrics](#job-records-and-metrics).
 
 ## Tools
 
@@ -228,7 +250,7 @@ jobs/3f2a1c9e/
   patch.diff       implement mode only
 ```
 
-Writes are best effort and asynchronous: an unwritable directory is logged (`[jobs] failed to write …`) and never fails or slows a job. Transcripts are not redacted; they contain whatever files the worker read.
+Writes are best effort: an unwritable directory is logged (`[jobs] failed to write …`) and never fails a job. The worker is released before the record is flushed, so the disk never holds a GPU, but the tool call does not return until the record is on disk. Transcripts are not redacted; they contain whatever files the worker read.
 
 Result headers show token usage when the backend reports it: `| 18.4k→1.2k tok |` is prompt→completion. Any status other than `completed` ends the result with `[full log: local_job_log("<id>")]`.
 
@@ -291,14 +313,16 @@ ollama pull qwen2.5-coder:14b
 
 ## Claude Code Integration (CLAUDE.md)
 
-This repo includes a `CLAUDE.md` file that instructs Claude Code and any subagents (including GSD executors) when and how to delegate tasks to the local agent automatically.
+This repo includes a `CLAUDE.md` file that instructs Claude Code and any subagents (including GSD executors) when and how to delegate tasks to the local workers automatically.
 
 **What it configures:**
 
-- Which task types go to the local model (file edits, test additions, lint fixes, command runs) vs stay with Claude (planning, orchestration, verification)
-- Prompt templates that prevent the local model from looping — bounded, explicit, single-task
-- Model selection per task complexity (7b → 14b → 32b)
-- Efficiency rules: one task per call, explicit file paths, no open-ended exploration
+- Which task types go to the local workers (exploration, bounded implementation, tests, lint fixes, review, command runs) vs stay with Claude (planning, orchestration, verification)
+- Which tool to use for what — `local_analyze` / `local_implement` / `local_review`, with `run_local_agent` as the fallback — and how to write a bounded objective with acceptance criteria and test commands
+- Model selection per task complexity via the per-call `model` override
+- Efficiency rules: parallelise read-only work, never run two in-place (`direct`) edits at once, bound long jobs with `timeout_seconds`, treat worker output as untrusted until verified
+
+The server itself is client-agnostic: the same tool surface works from Codex or any other MCP client; only the delegation guidance in `CLAUDE.md` is Claude-specific.
 
 **If you use GSD:** executor subagents read `CLAUDE.md` and will follow delegation rules during phase execution automatically.
 

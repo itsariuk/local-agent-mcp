@@ -108,7 +108,7 @@ export const TOOL_DEFINITIONS: OllamaToolDefinition[] = [
     function: {
       name: "bash",
       description:
-        "Execute a shell command and return its stdout and stderr. Commands are restricted to a safe allow-list by default: git, ls, cat, echo, grep, head, tail, wc, find, mkdir, cp, mv, touch, npm, node, python. Use this to run builds, tests, git operations, and explore the filesystem. Use replace_text or write_file for edits, not shell redirection. In read-only mode only inspection commands are allowed.",
+        "Execute a shell command and return its stdout and stderr. Commands are restricted to a safe allow-list by default: git, ls, cat, echo, grep, head, tail, wc, find, mkdir, cp, mv, touch, npm, npx, node, python. Use this to run builds, tests, git operations, and explore the filesystem. Use replace_text or write_file for edits, not shell redirection. In read-only mode only inspection commands are allowed.",
       parameters: {
         type: "object",
         properties: {

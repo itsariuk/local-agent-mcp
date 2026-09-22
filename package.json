@@ -4,6 +4,9 @@
   "description": "Run local AI agents via Claude Code -- delegates tasks to Ollama with file and shell tools",
   "type": "module",
   "main": "build/index.js",
+  "engines": {
+    "node": ">=20.3"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
